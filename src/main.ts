@@ -298,7 +298,7 @@ function isBuild(b: unknown): b is CharacterBuild {
       if (!meta?.builds) return;
       lobby?.destroy();
       lobby = null;
-      const back = () => { closeScreen = null; openLobby(); };
+      const back = () => openLobby(); // openLobby() closes this builder via closeScreen
       closeScreen = showCreate((b) => {
         void roomCall({ op: 'intent', code, playerId: me.id, intent: { type: 'build', idx, build: b[idx] } });
         back();
