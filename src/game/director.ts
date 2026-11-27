@@ -1565,6 +1565,12 @@ export class Director {
     this.mode = 'combat';
     this.s.sneaking = false;
     for (const m of monsters) { delete m.conds.asleep; }
+    // Nobody starts a fight under an old Sleep spell (this also repairs saves made before the fix).
+    for (const h of this.s.party) {
+      if (!h.conds.asleep) continue;
+      delete h.conds.asleep;
+      if (h.hp > 0) delete h.conds.prone;
+    }
     const c = new Combat(this.w, this.p);
     this.combat = c;
     // Combat may start from inside a tap handler; release its lock so the player can act.
@@ -1593,7 +1599,8 @@ export class Director {
     this.mode = 'explore';
     for (const c of this.s.party) {
       if (!c.death.dead && c.hp <= 0) { c.death.stable = true; }
-      for (const k of ['blessed', 'dodging', 'hidden', 'sapped', 'guided', 'shielded', 'slowed', 'vexed', 'aimed', 'frightened', 'prone'] as const) delete c.conds[k];
+      // Magical sleep ends with the fight (the caster's concentration is dropped just below).
+      for (const k of ['blessed', 'dodging', 'hidden', 'sapped', 'guided', 'shielded', 'slowed', 'vexed', 'aimed', 'frightened', 'prone', 'asleep'] as const) delete c.conds[k];
       c.concentration = undefined;
     }
     const xp = monsters.filter((m) => m.hp <= 0).reduce((s, m) => s + m.xpValue, 0);
@@ -1979,6 +1986,14 @@ export class Director {
       wrongKind: 'Only a dying ally can be stabilised', odds: () => `${Math.round(chance(checkBonus(cur, 'wis'), 10) * 100)}%`,
       run: (t) => c.actStabilize(cur, t),
     }, noAct));
+    if (c.alliesOf(cur).some((a) => a.conds.asleep)) {
+      out.push(this.aimOption(cur, { label: 'Wake ally', icon: 'heal', sub: 'Shake a magically sleeping ally next to you awake. They still have to stand up.' }, {
+        label: 'Wake ally', range: 1, melee: true, color: PAL.verdigris,
+        pool: () => c.alliesOf(cur).filter((a) => !!a.conds.asleep), none: 'No sleeping ally next to you',
+        wrongKind: 'Only a sleeping ally can be woken', odds: () => 'Wake',
+        run: (t) => c.actWake(cur, t),
+      }, noAct));
+    }
     if (c.brazier && c.brazier.hp > 0) {
       const dc = 13 + (this.s.omen.omen.mods.brazierDC ?? 0);
       const br = (how: 'arcana' | 'athletics', label: string, kind: 'arcana' | 'athletics', d: number) => this.aimOption(cur,

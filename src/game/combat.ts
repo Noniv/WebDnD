@@ -657,6 +657,15 @@ export class Combat {
     this.after();
   }
 
+  /** Shake a magically sleeping ally awake (an action, standing next to them). */
+  async actWake(a: Creature, t: Creature): Promise<void> {
+    if (!t.conds.asleep || dist(a.pos, t.pos) > 1) return;
+    if (!this.spendAction()) return;
+    delete t.conds.asleep;
+    this.p.log(`${a.name} shakes ${t.name} awake.`, 'good');
+    this.after();
+  }
+
   async actDouse(a: Creature, how: 'arcana' | 'athletics'): Promise<void> {
     const b = this.brazier;
     if (!b || b.hp <= 0 || dist(a.pos, b.pos) > 1 || !this.spendAction()) return;
