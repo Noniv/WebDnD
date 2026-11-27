@@ -1,74 +1,136 @@
-// Host side of co-op: publishes snapshots + events, receives intents, and routes
-// prompts to whichever player controls the hero that has to decide.
+// Host side of co-op: the host's browser runs the game and streams it to guests over
+// peer-to-peer links (events the moment they happen, snapshots a few times a second),
+// receives intents, and routes prompts to whichever player controls the deciding hero.
 import type { Creature } from '../rules/creature';
 import type { GameState } from '../game/state';
 import { Hud, type DockBtn, type SheetSpec, type SheetOption } from '../ui/hud';
 import { h } from '../ui/dom';
 import { sfx } from '../ui/sfx';
-import { roomCall } from './api';
-import type { DockSpec, IncomingIntent, NetEvent, OptSpec, PromptSpec, RoomMeta, ViewModel } from './protocol';
+import { Wire } from './p2p';
+import type { DockSpec, IncomingIntent, Intent, NetEvent, OptSpec, PromptSpec, RoomInfo, RoomMeta, Snapshot, ViewModel, WireMsg } from './protocol';
 
-const ONLINE_MS = 15000;
+const MAX_GUESTS = 3;
+const SNAP_MS = 150;
+const cleanName = (s: unknown) => String(s ?? '').replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 18) || 'Adventurer';
 
 export class HostLink {
   code: string;
-  hostKey: string;
   me: string;
+  /** Player id -> name, host included. */
   names: Record<string, string> = {};
+  /** Seat index -> player id. */
   seats: Record<string, string> = {};
-  seen: Record<string, number> = {};
   meta: RoomMeta;
   vm: ViewModel = {
-    mode: 'explore', leader: 0, turnId: null, chips: [], turnbar: null, order: null, dock: { for: null, buttons: [] },
+    mode: 'explore', leader: 0, leads: {}, turnId: null, chips: [], turnbar: null, order: null, dock: { for: null, buttons: [] },
     marks: {}, prompt: null, end: null, owners: {}, names: {},
   };
+  private wire: Wire | null = null;
+  /** Connected peer id -> player id. */
+  private peerPlayer = new Map<string, string>();
   private events: NetEvent[] = [];
-  private lastSent = '';
+  private flushQueued = false;
+  private lastSnap = '';
   private timer = 0;
-  private running = false;
-  private metaDirty = true;
   getState: () => GameState | null = () => null;
   getMarks: () => ViewModel['marks'] = () => ({});
   onIntent: (i: IncomingIntent) => void = () => {};
   onPlayers: () => void = () => {};
   error = '';
 
-  constructor(code: string, hostKey: string, me: string, meta: RoomMeta) {
+  constructor(code: string, me: string, myName: string, meta: RoomMeta) {
     this.code = code;
-    this.hostKey = hostKey;
     this.me = me;
+    this.names[me] = myName;
     this.meta = meta;
   }
 
   start(): void {
-    if (this.running) return;
-    this.running = true;
-    const loop = async () => {
-      if (!this.running) return;
-      try { await this.sync(); this.error = ''; } catch (e) { this.error = String((e as Error).message ?? e); }
-      this.timer = window.setTimeout(loop, document.hidden ? 4000 : 700);
+    if (this.wire) return;
+    const w = new Wire(this.code);
+    this.wire = w;
+    w.onJoin = (peer) => w.send({ t: 'hello', id: this.me, name: this.names[this.me], role: 'host' }, peer);
+    w.onMsg = (m, peer) => this.receive(m, peer);
+    w.onLeave = (peer) => {
+      if (!this.peerPlayer.delete(peer)) return;
+      this.broadcastRoom();
+      this.onPlayers();
     };
-    void loop();
+    w.onError = (msg) => { this.error = msg; this.onPlayers(); };
+    this.timer = window.setInterval(() => this.flush(), SNAP_MS);
   }
 
   stop(): void {
-    this.running = false;
-    clearTimeout(this.timer);
+    clearInterval(this.timer);
+    this.flush();
+    this.wire?.leave();
+    this.wire = null;
+    this.peerPlayer.clear();
   }
 
-  emit(ev: NetEvent): void {
-    this.events.push(ev);
-    if (this.events.length > 600) this.events.splice(0, this.events.length - 600);
+  private receive(m: WireMsg, peer: string): void {
+    if (m.t === 'hello' && m.role === 'guest' && typeof m.id === 'string') {
+      const others = new Set([...this.peerPlayer.entries()].filter(([p]) => p !== peer).map(([, id]) => id));
+      others.delete(m.id);
+      if (others.size >= MAX_GUESTS) { this.wire?.send({ t: 'full' }, peer); return; }
+      // Same player on a new connection (reload): forget the old one.
+      for (const [p, id] of this.peerPlayer) if (id === m.id && p !== peer) this.peerPlayer.delete(p);
+      this.peerPlayer.set(peer, m.id);
+      this.names[m.id] = cleanName(m.name);
+      this.broadcastRoom();
+      this.sendSnap(peer);
+      this.onPlayers();
+      return;
+    }
+    if (m.t === 'intent') {
+      const from = this.peerPlayer.get(peer);
+      if (!from || !m.intent || typeof m.intent !== 'object') return;
+      if (m.intent.type === 'seat') { this.guestSeat(from, m.intent); return; }
+      this.onIntent({ ...m.intent, from, t: Date.now() });
+    }
+  }
+
+  // ----- room / lobby -----
+
+  room(): RoomInfo {
+    return { meta: this.meta, names: this.names, seats: this.seats, online: this.onlineIds() };
+  }
+
+  onlineIds(): string[] {
+    return [this.me, ...new Set(this.peerPlayer.values())];
+  }
+
+  private broadcastRoom(): void {
+    this.wire?.send({ t: 'room', room: this.room() });
   }
 
   setMeta(patch: Partial<RoomMeta>): void {
     this.meta = { ...this.meta, ...patch };
-    this.metaDirty = true;
+    this.broadcastRoom();
+  }
+
+  /** The host seats anyone (or frees a seat with `pid` null). */
+  setSeat(idx: number, pid: string | null): void {
+    if (pid) this.seats[String(idx)] = pid;
+    else delete this.seats[String(idx)];
+    this.broadcastRoom();
+    this.onPlayers();
+  }
+
+  private guestSeat(from: string, i: Extract<Intent, { type: 'seat' }>): void {
+    if (!Number.isInteger(i.seat) || i.seat < 0 || i.seat > 3) return;
+    const key = String(i.seat);
+    const cur = this.seats[key];
+    if (i.take && (!cur || cur === from)) this.seats[key] = from;
+    else if (!i.take && cur === from) delete this.seats[key];
+    this.broadcastRoom();
+    this.onPlayers();
   }
 
   isOnline(id: string): boolean {
     if (id === this.me) return true;
-    return Date.now() - (this.seen[id] ?? 0) < ONLINE_MS;
+    for (const v of this.peerPlayer.values()) if (v === id) return true;
+    return false;
   }
 
   /** Hero id -> controlling player id (seat owner, else the host). */
@@ -78,35 +140,46 @@ export class HostLink {
     return out;
   }
 
-  async sync(): Promise<void> {
+  // ----- game stream -----
+
+  emit(ev: NetEvent): void {
+    this.events.push(ev);
+    if (this.flushQueued) return;
+    this.flushQueued = true;
+    queueMicrotask(() => this.flushEvents());
+  }
+
+  private flushEvents(): void {
+    this.flushQueued = false;
+    if (!this.events.length) return;
+    const evs = this.events.splice(0);
+    this.wire?.send({ t: 'evs', evs });
+  }
+
+  private snapshot(): { snap: Snapshot; key: string } | null {
     const state = this.getState();
-    let stateOut: unknown;
-    if (state) {
-      this.vm.marks = this.getMarks();
-      this.vm.owners = this.owners(state.party);
-      this.vm.names = this.names;
-      const snap = JSON.stringify({ state: { ...state, log: [] }, vm: this.vm });
-      if (snap !== this.lastSent) { stateOut = JSON.parse(snap); this.lastSent = snap; }
-    }
-    const events = this.events.splice(0, 400);
-    const r = await roomCall<{
-      intents: IncomingIntent[]; players: Record<string, string>; seats: Record<string, string>; seen: Record<string, string>; now: number;
-    }>({
-      op: 'host', code: this.code, hostKey: this.hostKey, playerId: this.me,
-      meta: this.metaDirty ? this.meta : undefined, state: stateOut, events,
-    }).catch((e) => { this.events.unshift(...events); if (stateOut) this.lastSent = ''; throw e; });
-    this.metaDirty = false;
-    const skew = Date.now() - r.now;
-    const names: Record<string, string> = {};
-    for (const [id, v] of Object.entries(r.players)) { try { names[id] = JSON.parse(v).name; } catch { names[id] = '?'; } }
-    const seen: Record<string, number> = {};
-    for (const [id, t] of Object.entries(r.seen)) seen[id] = Number(t) + skew;
-    const changed = JSON.stringify([names, r.seats]) !== JSON.stringify([this.names, this.seats]);
-    this.names = names;
-    this.seats = r.seats;
-    this.seen = seen;
-    if (changed) this.onPlayers();
-    for (const i of r.intents) this.onIntent(i);
+    if (!state) return null;
+    this.vm.marks = this.getMarks();
+    this.vm.owners = this.owners(state.party);
+    this.vm.names = this.names;
+    const snap: Snapshot = { state: { ...state, log: [] }, vm: this.vm };
+    return { snap, key: JSON.stringify(snap) };
+  }
+
+  /** Send pending events, then the state if it changed (so a snapshot never runs ahead of its events). */
+  flush(): void {
+    this.flushEvents();
+    if (!this.wire || !this.peerPlayer.size) return;
+    const s = this.snapshot();
+    if (!s || s.key === this.lastSnap) return;
+    this.lastSnap = s.key;
+    this.wire.send({ t: 'snap', snap: s.snap });
+  }
+
+  private sendSnap(peer: string): void {
+    this.flushEvents();
+    const s = this.snapshot();
+    if (s) this.wire?.send({ t: 'snap', snap: s.snap }, peer);
   }
 }
 
@@ -138,6 +211,11 @@ export class HostHud extends Hud {
   override log(msg: string, tone = 'info'): void { super.log(msg, tone); this.link.emit({ k: 'log', msg, tone }); }
   override showBanner(title: string, text: string, ms = 4200): void { super.showBanner(title, text, ms); this.link.emit({ k: 'banner', title, text, ms }); }
   override toast(text: string): void { super.toast(text); this.link.emit({ k: 'toast', text }); }
+  /** A message for one player only (e.g. why their tap did nothing). */
+  toastTo(pid: string, text: string): void {
+    if (pid === this.link.me) super.localToast(text);
+    else this.link.emit({ k: 'toast', text, to: pid });
+  }
   override setChips(list: { text: string; icon?: string; cls?: string; toast?: string }[]): void { super.setChips(list); this.link.vm.chips = list; }
   override setTurnbar(info: ViewModel['turnbar']): void { super.setTurnbar(info); this.link.vm.turnbar = info; }
   override setOrder(list: ViewModel['order']): void { super.setOrder(list); this.link.vm.order = list; }
@@ -287,7 +365,15 @@ export class HostHud extends Hud {
   override dialogue<T>(speaker: { name: string; portrait?: string; narrator: boolean }, text: string, options: SheetOption<T>[], party: Creature[],
     mode: { readonly?: string; override?: () => void } = {}): Promise<{ value: T; actor: Creature | null } | null> {
     const to = this.remoteDecider();
-    if (!to || mode.readonly) return super.dialogue(speaker, text, options, party, mode);
+    if (mode.readonly) return super.dialogue(speaker, text, options, party, mode);
+    if (!to) {
+      // Decided on this device: everyone else watches the conversation read-only.
+      const watch = this.toSpec(crypto.randomUUID(), this.link.me, 'dialogue', speaker.name, options, { speaker, lead: text, partyIds: party.map((c) => c.id) });
+      this.link.vm.prompt = watch;
+      return super.dialogue(speaker, text, options, party, mode).finally(() => {
+        if (this.link.vm.prompt?.id === watch.id) this.link.vm.prompt = null;
+      });
+    }
     const ps = this.toSpec(crypto.randomUUID(), to, 'dialogue', speaker.name, options, { speaker, lead: text, partyIds: party.map((c) => c.id) });
     this.dialogueArgs = { speaker, text, options: options as SheetOption<unknown>[], party };
     return this.ask(ps, async () => {

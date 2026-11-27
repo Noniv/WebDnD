@@ -27,7 +27,7 @@ import { inRect, type MapObject } from './dungeon';
 import { computeVisible, pathAdjacent, pathTo, canSee } from './grid';
 import type { Presenter } from './presenter';
 import { saveGame } from './save';
-import { addLog, armedTrapAt, creatureAt, dist, livingParty, objectsAt, roomAt, type World } from './state';
+import { addLog, armedTrapAt, creatureAt, dist, invSummary, livingParty, objectsAt, roomAt, type World } from './state';
 
 type TargetMode =
   | { kind: 'aim'; aim: Aim }
@@ -50,7 +50,14 @@ export class Director {
   mode: 'explore' | 'combat' | 'end' = 'explore';
   private pendingMove: Pos | null = null;
   private target: TargetMode = null;
-  private roomId: string | null = null;
+  /** Last room each lead hero was in (in co-op each player's heroes explore on their own). */
+  private roomOf = new Map<string, string>();
+  /** Player id -> index of the hero they lead while exploring. */
+  private leads: Record<string, number> = {};
+  /** Walks in progress, by player. A new tap from the same player re-routes their walk. */
+  private walks = new Map<string, { stop: boolean; done: Promise<void> }>();
+  /** Above 0 while a scene (a conversation, a sprung trap) holds every hero in place. */
+  private scene = 0;
   private searched = new Set<string>();
   private cryptAlerted = false;
   private hooks: DirectorHooks;
@@ -101,7 +108,11 @@ export class Director {
       case 'tap': void this.onTap({ x: i.x, y: i.y }, i.from); break;
       case 'dock': hh.dockTap(i.id, i.from); break;
       case 'answer': hh.answer(i.pid, i.index, i.actorId, i.from); break;
-      case 'leader': if (this.s.party[i.idx] && this.mode !== 'combat' && !this.busy) this.selectLeader(i.idx, i.from); break;
+      case 'leader':
+        if (!this.s.party[i.idx]) break;
+        if (this.mode !== 'combat' && this.blocked) this.tellBusy(i.from);
+        else this.selectLeader(i.idx, i.from);
+        break;
     }
   }
 
@@ -113,11 +124,22 @@ export class Director {
   private makePresenter(): Presenter {
     return {
       roll: async (r, note) => {
-        this.emit({ k: 'roll', r, note });
         this.hud.log(`${r.who}: ${r.label} ${r.d20.kept}${r.bonus ? fmtMod(r.bonus) : ''} = ${r.total} vs ${r.targetKind} ${r.target} → ${r.crit ? 'critical!' : r.success ? 'success' : 'failure'}`, 'roll');
+        // In a fight the dice roll unseen (hits, misses and damage show on the map); the overlay is for checks.
+        if (this.mode === 'combat') return;
+        this.emit({ k: 'roll', r, note });
         await this.dice.show(r, note);
       },
-      rolls: async (rs, title) => { this.emit({ k: 'rolls', rs, title }); await this.dice.showMany(rs, title); },
+      rolls: async (rs, title) => {
+        if (this.mode === 'combat') {
+          // Saves get a one-line summary; initiative (no target to beat) is logged by the combat itself.
+          const vs = rs.filter((r) => r.target > 0);
+          if (vs.length) this.hud.log(`${title}: ${vs.map((r) => `${r.who} ${r.total} ${r.success ? '✓' : '✗'}`).join(', ')}`, 'roll');
+          return;
+        }
+        this.emit({ k: 'rolls', rs, title });
+        await this.dice.showMany(rs, title);
+      },
       damage: (t, amount, crit, note) => {
         this.emit({ k: 'damage', id: t.id, amount, crit, note });
         showDamage(this.view, t, amount, crit, note);
@@ -130,7 +152,13 @@ export class Director {
       },
       float: (at, text, color) => { this.emit({ k: 'float', at, text, color }); this.view.floatText(at, text, color); },
       log: (msg, tone) => { this.hud.log(msg, tone); addLog(this.w, msg); },
-      move: (c, path, ms) => { this.emit({ k: 'move', id: c.id, path, ms: ms ?? CONFIG.STEP_MS }); return this.view.moveToken(c, path, ms ?? CONFIG.STEP_MS); },
+      move: (c, path, ms) => {
+        this.emit({ k: 'move', id: c.id, path, ms: ms ?? CONFIG.STEP_MS });
+        const anim = this.view.moveToken(c, path, ms ?? CONFIG.STEP_MS);
+        // Update the state as the move starts, so a co-op snapshot never shows the hero behind its animation.
+        if (path.length) c.pos = { ...path[path.length - 1] };
+        return anim;
+      },
       effect: async (kind, from, to) => { this.emit({ k: 'fx', kind, from, to }); await playFx(this.view, kind, from, to); },
       shake: (n) => { this.emit({ k: 'shake', n }); this.view.shake(n); },
       refresh: () => this.refresh(),
@@ -144,7 +172,7 @@ export class Director {
   start(isLoad: boolean): void {
     this.view.build(this.w);
     this.refresh();
-    this.roomId = roomAt(this.w, this.leader.pos)?.id ?? null;
+    for (const c of this.s.party) { const r = roomAt(this.w, c.pos); if (r) this.roomOf.set(c.id, r.id); }
     const room = roomAt(this.w, this.leader.pos);
     if (!isLoad) {
       this.hud.showBanner(room?.name ?? 'Emberdeep', room?.intro ?? '', 6000);
@@ -189,12 +217,10 @@ export class Director {
 
   refreshHud(): void {
     const turnId = this.combat && this.mode === 'combat' ? this.combat.current?.id ?? null : null;
-    this.hud.renderParty(this.s.party, this.s.leader, turnId);
+    if (this.link) this.link.vm.leads = Object.fromEntries(this.link.onlineIds().map((pid) => [pid, this.leadIdx(pid)]));
+    this.hud.renderParty(this.s.party, this.mode === 'explore' ? this.leadIdx(this.me) : this.s.leader, turnId);
+    // Only states and the day's omen sit on the map; the inventory lives in Menu → Inventory.
     const chips: { text: string; icon?: string; cls?: string; toast?: string }[] = [];
-    if (this.s.inv.potions) chips.push({ text: `${this.s.inv.potions}`, icon: 'potion' });
-    if (this.s.inv.keys.length) chips.push({ text: 'Crypt key', icon: 'key', cls: 'ember' });
-    if (this.s.inv.phial) chips.push({ text: 'Ember Phial', icon: 'turn_undead', cls: 'ember' });
-    if (this.s.inv.gold) chips.push({ text: `${this.s.inv.gold} gp`, icon: 'gold' });
     if (this.s.sneaking && this.mode === 'explore') chips.push({ text: 'Sneaking', icon: 'sneak', cls: 'arc' });
     const canLvl = this.s.party.some((c) => !c.death.dead && levelForXp(c.xp) > c.level);
     if (canLvl) chips.push({ text: 'Level up at a long rest', icon: 'xp', cls: 'ember' });
@@ -205,62 +231,123 @@ export class Director {
   }
 
   private selectLeader(i: number, from: string = this.me): void {
-    if (this.mode === 'combat') {
-      const c = this.s.party[i];
+    const c = this.s.party[i];
+    // In a fight, or someone else's hero: just show the sheet.
+    if (this.mode === 'combat' || (this.link && this.ownerOf(c) !== from)) {
+      this.hud.decider = from;
       this.hud.showCharacter(c);
       return;
     }
-    if (this.s.party[i].death.dead) return;
+    if (c.death.dead) { this.tellPlayer(from, `${c.name} has fallen and cannot lead.`); return; }
+    this.leads[from] = i;
     this.s.leader = i;
-    this.view.setActive(this.s.party[i].id);
-    if (from === this.me) this.view.focus(this.s.party[i].pos);
+    if (from === this.me) { this.view.setActive(c.id); this.view.focus(c.pos); }
     this.refreshHud();
+  }
+
+  // ---------- Who moves what ----------
+
+  /** The heroes a player moves together while exploring (the whole party in single-player). */
+  private groupOf(pid: string): Creature[] {
+    const living = this.s.party.filter((c) => !c.death.dead);
+    return this.link ? living.filter((c) => this.ownerOf(c) === pid) : living;
+  }
+
+  /** Index of the hero `pid` leads: their pick if it is still theirs, else their first standing hero. */
+  private leadIdx(pid: string): number {
+    const mine = this.groupOf(pid);
+    const pick = this.s.party[this.leads[pid] ?? -1];
+    if (pick && mine.includes(pick)) return this.leads[pid];
+    const first = mine.find((c) => c.hp > 0) ?? mine[0];
+    return first ? this.s.party.indexOf(first) : this.s.leader;
+  }
+
+  /** Point the exploration actions (search, traps, rooms) at `pid`'s lead hero. */
+  private useLead(pid: string): void {
+    if (this.mode === 'explore') this.s.leader = this.leadIdx(pid);
+  }
+
+  /** Something holds the table (an interaction or a scene): new actions must wait. */
+  private get blocked(): boolean { return this.busy || this.scene > 0; }
+
+  /** A message for one player only. */
+  private tellPlayer(pid: string, msg: string): void {
+    sfx.deny();
+    if (this.link) (this.hud as HostHud).toastTo(pid, msg);
+    else this.hud.localToast(msg);
+  }
+
+  private tellBusy(pid: string): void {
+    const who = this.hud.decider;
+    const name = who && who !== pid && this.link ? this.link.names[who] : null;
+    this.tellPlayer(pid, name ? `Wait a moment: ${name} is in the middle of something.` : 'Wait a moment: finish what is happening first.');
+  }
+
+  /** Stop `pid`'s walk (if any) at its next square. */
+  private async stopWalk(pid: string): Promise<void> {
+    const w = this.walks.get(pid);
+    if (!w) return;
+    w.stop = true;
+    await w.done;
   }
 
   // ---------- Input ----------
 
   private async onTap(p: Pos, from: string = this.me): Promise<void> {
-    if (this.busy || this.mode === 'end') return;
+    if (this.mode === 'end') return;
     if (p.x < 0 || p.y < 0 || p.x >= this.w.def.w || p.y >= this.w.def.h) return;
     if (this.mode === 'combat') return this.combatTap(p, from);
-    this.hud.decider = from;
-    // In co-op, whoever moves the party leads with their own hero.
-    if (this.link && this.ownerOf(this.leader) !== from) {
-      const mine = this.s.party.findIndex((c) => !c.death.dead && c.hp > 0 && this.ownerOf(c) === from);
-      if (mine >= 0) { this.s.leader = mine; this.view.setActive(this.leader.id); }
-    }
+    if (this.blocked) { this.tellBusy(from); return; }
     const seen = this.s.seen[p.y * this.w.def.w + p.x] === 1;
-    if (!seen) { sfx.deny(); return; }
+    if (!seen) { this.tellPlayer(from, 'You have not explored there yet.'); return; }
+    const group = this.groupOf(from);
+    if (!group.length) { this.tellPlayer(from, 'You have no hero to move. Take one in the lobby next time.'); return; }
     // creature?
     const mon = this.s.monsters.find((m) => m.hp > 0 && m.pos.x === p.x && m.pos.y === p.y && m.faction !== 'object');
-    if (mon && this.visibleNow(p)) return this.tapMonster(mon);
+    if (mon && this.visibleNow(p)) {
+      await this.stopWalk(from);
+      if (this.blocked) { this.tellBusy(from); return; }
+      this.hud.decider = from;
+      this.useLead(from);
+      this.busy = true;
+      try { await this.tapMonster(mon); } finally { this.busy = false; this.exploreDock(); }
+      return;
+    }
     // object?
     const obj = objectsAt(this.w, p).find((o) => !o.hidden && o.kind !== 'bones');
     if (obj) {
+      await this.stopWalk(from);
+      if (this.blocked) { this.tellBusy(from); return; }
+      this.hud.decider = from;
+      this.useLead(from);
       this.busy = true;
       try {
         const adj = obj.kind === 'trap' ? this.trapApproach(obj) : pathAdjacent(this.w, this.leader.pos, obj.pos, { avoidTraps: true, blockers: this.blockers() });
-        if (adj === null) { this.hud.log('You cannot reach that from here.'); sfx.deny(); return; }
-        if (adj.length) { const ok = await this.walk(adj); if (!ok) return; }
+        if (adj === null) { this.tellPlayer(from, 'You cannot reach that from here.'); return; }
+        if (adj.length) { const ok = await this.walk(adj, from); if (!ok) return; }
         await this.interact(obj);
       } finally { this.busy = false; this.exploreDock(); }
       return;
     }
-    this.busy = true;
-    try {
-      // While unseen in the den, prefer routes that keep a square away from every goblin.
-      const wary = this.s.den === 'sneaked' ? this.denGoblins() : [];
-      const forbid = wary.length ? (q: Pos) => wary.some((g) => dist(g.pos, q) <= 1) : undefined;
-      const path = (forbid && pathTo(this.w, this.leader.pos, p, { avoidTraps: true, blockers: this.blockers(), forbid }))
-        || pathTo(this.w, this.leader.pos, p, { avoidTraps: true, blockers: this.blockers() });
-      if (!path) {
-        const trap = this.s.objects.find((o) => o.kind === 'trap' && !o.hidden && o.armed);
-        this.hud.log(trap && this.trapBetween(p) ? 'The needle plates bar the way. Deal with the trap first.' : 'No way through.');
-        sfx.deny();
-        return;
-      }
-      await this.walk(path);
-    } finally { this.busy = false; this.exploreDock(); }
+    // Plain walk: other players keep moving their own heroes meanwhile.
+    await this.stopWalk(from);
+    if (this.blocked) { this.tellBusy(from); return; }
+    this.useLead(from);
+    // While unseen in the den, prefer routes that keep a square away from every goblin.
+    const wary = this.s.den === 'sneaked' ? this.denGoblins() : [];
+    const forbid = wary.length ? (q: Pos) => wary.some((g) => dist(g.pos, q) <= 1) : undefined;
+    const path = (forbid && pathTo(this.w, this.leader.pos, p, { avoidTraps: true, blockers: this.blockers(), forbid }))
+      || pathTo(this.w, this.leader.pos, p, { avoidTraps: true, blockers: this.blockers() });
+    if (!path) {
+      const trap = this.s.objects.find((o) => o.kind === 'trap' && !o.hidden && o.armed);
+      this.tellPlayer(from, trap && this.trapBetween(p) ? 'The needle plates bar the way. Deal with the trap first.' : 'No way through.');
+      return;
+    }
+    // You can pass a friend, but not stop on their square.
+    const others = this.s.party.filter((c) => !c.death.dead && !group.includes(c));
+    while (path.length && others.some((o) => o.pos.x === path[path.length - 1].x && o.pos.y === path[path.length - 1].y)) path.pop();
+    if (!path.length) { this.tellPlayer(from, 'Someone is already standing there.'); return; }
+    try { await this.walk(path, from); } finally { if (!this.blocked) this.exploreDock(); }
   }
 
   private blockers(): Creature[] {
@@ -281,36 +368,56 @@ export class Director {
 
   // ---------- Walking ----------
 
-  /** Walk the party in a line. Returns false if something interrupted the walk. */
-  async walk(path: Pos[]): Promise<boolean> {
-    const order = [this.leader, ...this.s.party.filter((c) => c.id !== this.leader.id && !c.death.dead)];
+  /**
+   * Walk a player's heroes in a line (the whole party in single-player). Other players'
+   * heroes stay put. Returns false if something interrupted the walk.
+   */
+  async walk(path: Pos[], pid: string = this.hud.decider ?? this.me): Promise<boolean> {
+    const lead = this.s.party[this.leadIdx(pid)];
+    const order = [lead, ...this.groupOf(pid).filter((c) => c.id !== lead.id)];
     const ms = CONFIG.WALK_MS * (this.s.sneaking ? 1.6 : 1);
-    for (const step of path) {
-      const moves: { c: Creature; to: Pos }[] = [];
-      let prev = { ...order[0].pos };
-      moves.push({ c: order[0], to: step });
-      for (let i = 1; i < order.length; i++) {
-        const c = order[i];
-        const here = { ...c.pos };
-        if (dist(c.pos, moves[i - 1].to) > 1 || (c.pos.x === moves[i - 1].to.x && c.pos.y === moves[i - 1].to.y)) moves.push({ c, to: prev });
-        else moves.push({ c, to: here });
-        prev = here;
+    let finish: () => void = () => {};
+    const me = { stop: false, done: new Promise<void>((r) => (finish = r)) };
+    this.walks.set(pid, me);
+    try {
+      for (const step of path) {
+        if (me.stop || this.scene > 0 || this.mode !== 'explore') return false;
+        const others = this.s.party.filter((c) => !c.death.dead && !order.includes(c));
+        const taken = (q: Pos) => others.some((o) => o.pos.x === q.x && o.pos.y === q.y);
+        const moves: { c: Creature; to: Pos }[] = [];
+        let prev = { ...order[0].pos };
+        moves.push({ c: order[0], to: step });
+        for (let i = 1; i < order.length; i++) {
+          const c = order[i];
+          const here = { ...c.pos };
+          const follow = dist(c.pos, moves[i - 1].to) > 1 || (c.pos.x === moves[i - 1].to.x && c.pos.y === moves[i - 1].to.y);
+          moves.push({ c, to: follow && !taken(prev) ? prev : here });
+          prev = here;
+        }
+        // State first, then the animation: a co-op snapshot taken mid-step already shows where everyone ends up.
+        for (const m of moves) m.c.pos = { ...m.to };
+        this.emit({ k: 'group', steps: moves.map((m) => ({ id: m.c.id, to: m.to })), ms });
+        await this.view.moveGroup(moves, ms);
+        if (pid === this.me) this.view.focus(step);
+        sfx.step();
+        if (this.mode !== 'explore') return false;
+        // The checks below look at this walker's lead hero, and anything they trigger is this player's call.
+        this.s.leader = this.s.party.indexOf(order[0]);
+        if (!this.busy) this.hud.decider = pid;
+        // Trap underfoot?
+        const trap = armedTrapAt(this.w, step);
+        if (trap) { this.refresh(); await this.springTrap(order[0], trap); return false; }
+        const revealed = this.passiveSpot();
+        this.refresh();
+        if (await this.roomCheck(order[0])) return false;
+        if (revealed) return false;
+        if (await this.sneakProximity()) return false;
       }
-      this.emit({ k: 'group', steps: moves.map((m) => ({ id: m.c.id, to: m.to })), ms });
-      await this.view.moveGroup(moves, ms);
-      for (const m of moves) m.c.pos = { ...m.to };
-      this.view.focus(step);
-      sfx.step();
-      // Trap underfoot?
-      const trap = armedTrapAt(this.w, step);
-      if (trap) { this.refresh(); await this.springTrap(order[0], trap); return false; }
-      const revealed = this.passiveSpot();
-      this.refresh();
-      if (await this.roomCheck()) return false;
-      if (revealed) return false;
-      if (await this.sneakProximity()) return false;
+      return true;
+    } finally {
+      if (this.walks.get(pid) === me) this.walks.delete(pid);
+      finish();
     }
-    return true;
   }
 
   /** Passive Perception against hidden things in sight. Returns true only if a trap was spotted (that should stop a walk). */
@@ -355,10 +462,10 @@ export class Director {
 
   // ---------- Rooms & triggers ----------
 
-  private async roomCheck(): Promise<boolean> {
-    const room = roomAt(this.w, this.leader.pos);
-    if (!room || room.id === this.roomId) return false;
-    this.roomId = room.id;
+  private async roomCheck(lead: Creature = this.leader): Promise<boolean> {
+    const room = roomAt(this.w, lead.pos);
+    if (!room || room.id === this.roomOf.get(lead.id)) return false;
+    this.roomOf.set(lead.id, room.id);
     const first = !this.s.visited.includes(room.id);
     if (first) {
       this.s.visited.push(room.id);
@@ -368,14 +475,20 @@ export class Director {
     if (room.id === 'hall' && this.s.den === 'sneaked') this.award('den', 175, 'Slipped past the goblins unseen');
     this.save();
     if (room.id === 'den' && this.s.den === 'unaware') {
-      await this.denTrigger();
+      await this.holdScene(() => this.denTrigger());
       return true;
     }
     if (room.id === 'crypt' && !this.s.bossDone && this.wardenAlive()) {
-      await this.startBoss();
+      await this.holdScene(() => this.startBoss());
       return true;
     }
     return false;
+  }
+
+  /** Run a scene that stops every walking hero until it is over. */
+  private async holdScene(fn: () => Promise<void>): Promise<void> {
+    this.scene++;
+    try { await fn(); } finally { this.scene--; }
   }
 
   private denGoblins(): Creature[] {
@@ -417,7 +530,11 @@ export class Director {
 
   // ---------- Dialogue ----------
 
-  private async runDialogue(noticed: boolean): Promise<void> {
+  private runDialogue(noticed: boolean): Promise<void> {
+    return this.holdScene(() => this.dialogueScene(noticed));
+  }
+
+  private async dialogueScene(noticed: boolean): Promise<void> {
     this.s.denNoticed = noticed;
     const ctx: DCtx = { potions: this.s.inv.potions, fearKnown: false, insightTried: false, noticed, dcMod: this.s.omen.omen.mods.goblinDC ?? 0 };
     let node = SNIKK.start;
@@ -767,16 +884,17 @@ export class Director {
 
   private async crossTrap(o: MapObject, victim: Creature | null): Promise<void> {
     const dir = this.leader.pos.y > o.pos.y ? -1 : 1;
-    const order = [this.leader, ...this.s.party.filter((c) => c.id !== this.leader.id && !c.death.dead)];
+    const pid = this.hud.decider ?? this.me;
+    const order = [this.leader, ...this.groupOf(pid).filter((c) => c.id !== this.leader.id)];
     const landY = o.pos.y + dir * 2;
     const spots = [{ x: 9, y: landY }, { x: 8, y: landY }, { x: 10, y: landY }, { x: 9, y: landY + dir }];
+    order.forEach((c, i) => (c.pos = { ...spots[i] }));
     this.emit({ k: 'group', steps: order.map((c, i) => ({ id: c.id, to: spots[i] })), ms: 420 });
     await this.view.moveGroup(order.map((c, i) => ({ c, to: spots[i] })), 420);
-    order.forEach((c, i) => (c.pos = { ...spots[i] }));
-    this.view.focus(this.leader.pos);
+    if (pid === this.me) this.view.focus(this.leader.pos);
     this.refresh();
     if (victim) await this.springTrap(victim, o);
-    await this.roomCheck();
+    await this.roomCheck(this.leader);
   }
 
   // ---------- Rests ----------
@@ -872,7 +990,7 @@ export class Director {
     this.hud.setTurnbar(null);
     this.hud.setOrder(null);
     this.view.clearMarks();
-    this.view.setActive(this.leader.id);
+    this.view.setActive(this.s.party[this.leadIdx(this.me)].id);
     const btns: DockBtn[] = [
       { id: 'search', label: 'Search', icon: 'search', onTap: () => this.guard(() => this.search()) },
       { id: 'sneak', label: this.s.sneaking ? 'Sneaking' : 'Sneak', icon: 'sneak', on: this.s.sneaking, onTap: () => { this.s.sneaking = !this.s.sneaking; this.hud.log(this.s.sneaking ? 'You move quietly (half speed). Heavy armour makes Stealth harder.' : 'You stop sneaking.'); this.exploreDock(); this.refreshHud(); } },
@@ -884,7 +1002,11 @@ export class Director {
   }
 
   private async guard(fn: () => Promise<void>): Promise<void> {
-    if (this.busy) return;
+    const who = this.hud.decider ?? this.me;
+    if (this.blocked) { this.tellBusy(who); return; }
+    await this.stopWalk(who);
+    if (this.blocked) { this.tellBusy(who); return; }
+    this.useLead(who);
     this.busy = true;
     try { await fn(); } finally { this.busy = false; if (this.mode === 'explore') this.exploreDock(); }
   }
@@ -909,12 +1031,14 @@ export class Director {
   private async menu(): Promise<void> {
     const r = await this.hud.sheet<string>({
       title: 'Menu', options: [
+        { label: 'Inventory', sub: invSummary(this.s.inv), value: 'inv', icon: 'potion' },
         { label: 'Journal', sub: 'Everything that has happened.', value: 'log', icon: 'sheet' },
         { label: 'Party sheets', sub: 'Abilities, skills, spells, features.', value: 'sheets', icon: 'sheet' },
         { label: this.link ? 'Save and end the session for everyone' : 'Save and quit to title', value: 'quit', icon: 'close' },
       ],
     });
     if (!r) return;
+    if (r.value === 'inv') this.hud.showInventory(this.s.inv);
     if (r.value === 'log') this.hud.showLog();
     if (r.value === 'sheets') this.hud.showCharacter(this.leader);
     if (r.value === 'quit') { this.save(); this.hooks.onQuit(); }

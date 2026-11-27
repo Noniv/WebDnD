@@ -338,8 +338,11 @@ input { font: inherit; user-select: text; -webkit-user-select: text; touch-actio
 .who.on { background: var(--gold-grad); color: #1a1408; border-color: var(--gold-hi); }
 .who.on .m { color: #3a2a0a; }
 .who.down { opacity: 0.35; pointer-events: none; }
-.sheet .close { position: sticky; float: right; top: 0; border: 0; background: none; width: 40px; height: 40px; margin: -12px -10px 0 0; cursor: pointer; }
-.sheet .close img { width: 24px; opacity: 0.85; }
+/* Sticky and above the content: options scrolled under it must not cover (or steal taps from) the X. */
+.sheet .close { position: sticky; float: right; top: 0; z-index: 5; border: 0; border-radius: 50%; background: rgba(9, 13, 32, 0.88); box-shadow: 0 0 0 1px rgba(214, 178, 94, 0.35), 0 2px 8px rgba(0, 0, 0, 0.5); width: 40px; height: 40px; margin: -12px -10px 0 0; cursor: pointer; display: grid; place-items: center; }
+.sheet .close img { width: 22px; opacity: 0.9; }
+.inv-row { display: flex; gap: 12px; align-items: flex-start; }
+.inv-row .inv-ic { width: 30px; height: 30px; flex: none; margin-top: 1px; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 14px; color: var(--ivory); }
 .kv b { font-family: var(--display); color: var(--gold); }
 .feat { font-size: 14px; line-height: 1.4; margin: 0 0 7px; color: var(--ivory); }

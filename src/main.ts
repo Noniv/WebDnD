@@ -11,10 +11,11 @@ import { installTweens, setReducedMotion, setTimeScale } from './render/tween';
 import { MapView } from './render/view';
 import { buildCharacter, type CharacterBuild } from './rules/creature';
 import { CLASSES } from './rules/content';
-import { NetError, identity, roomCall, saveIdentity } from './net/api';
-import { GuestClient } from './net/guest';
+import { identity, saveIdentity } from './net/identity';
+import { GuestClient, GuestLink } from './net/guest';
 import { HostLink } from './net/host';
-import type { RoomMeta } from './net/protocol';
+import { newRoomCode } from './net/p2p';
+import type { RoomInfo } from './net/protocol';
 import { showCoopStart, LobbyView } from './ui/lobby';
 import { seedRng } from './rules/dice';
 import { defaultBuild, showCreate } from './ui/create';
@@ -40,13 +41,13 @@ async function fetchOmen(): Promise<OmenData> {
 }
 
 const HOSTING_KEY = 'emberdeep.hosting.v1';
-interface Hosting { code: string; hostKey: string; builds: CharacterBuild[]; t?: number }
+interface Hosting { code: string; builds: CharacterBuild[]; seats?: Record<string, string>; t?: number }
 function saveHosting(h: Hosting): void { try { localStorage.setItem(HOSTING_KEY, JSON.stringify({ ...h, t: Date.now() })); } catch { /* ignore */ } }
 function clearHosting(): void { try { localStorage.removeItem(HOSTING_KEY); } catch { /* ignore */ } }
 function loadHosting(): Hosting | null {
   try {
     const v = JSON.parse(localStorage.getItem(HOSTING_KEY) ?? 'null') as Hosting | null;
-    return v && v.code && v.hostKey && Date.now() - (v.t ?? 0) < 8 * 3600_000 ? v : null;
+    return v && v.code && Date.now() - (v.t ?? 0) < 8 * 3600_000 ? v : null;
   } catch { return null; }
 }
 function isBuild(b: unknown): b is CharacterBuild {
@@ -97,6 +98,7 @@ function isBuild(b: unknown): b is CharacterBuild {
   let director: Director | null = null;
   let guest: GuestClient | null = null;
   let link: HostLink | null = null;
+  let glink: GuestLink | null = null;
   let closeScreen: (() => void) | null = null;
   let timers: number[] = [];
   const popups = new Hud();
@@ -113,7 +115,7 @@ function isBuild(b: unknown): b is CharacterBuild {
     onReload: () => { const s = loadGame(); if (s) play(s); else create(); },
   };
 
-  /** Close screens, the game and any polling. Keeps the host link alive unless `dropLink`. */
+  /** Close screens and the game. Keeps the co-op links alive unless `dropLink`. */
   function teardown(dropLink = false): void {
     director?.destroy();
     director = null;
@@ -125,6 +127,7 @@ function isBuild(b: unknown): b is CharacterBuild {
     timers = [];
     popups.modal.innerHTML = '';
     if (dropLink && link) { link.stop(); link = null; }
+    if (dropLink && glink) { glink.leave(); glink = null; }
   }
 
   function title(): void {
@@ -137,7 +140,8 @@ function isBuild(b: unknown): b is CharacterBuild {
       onCoop: () => coopStart(''),
       onContinue: saved ? () => {
         if (hosting && saved.party.length) {
-          link = new HostLink(hosting.code, hosting.hostKey, me.id, { status: 'playing', hostId: me.id, builds: hosting.builds, created: Date.now() });
+          link = new HostLink(hosting.code, me.id, me.name || 'Host', { status: 'playing', hostId: me.id, builds: hosting.builds, created: Date.now() });
+          link.seats = { ...(hosting.seats ?? {}) };
           link.start();
         }
         play(saved);
@@ -185,27 +189,34 @@ function isBuild(b: unknown): b is CharacterBuild {
       onHost: async (name) => {
         me.name = name; saveIdentity(me);
         builds = (['fighter', 'rogue', 'wizard', 'cleric'] as const).map((c, i) => defaultBuild(c, i));
-        try {
-          const r = await roomCall<{ code: string; hostKey: string }>({ op: 'create', playerId: me.id, name, builds });
-          link = new HostLink(r.code, r.hostKey, me.id, { status: 'lobby', hostId: me.id, builds, created: Date.now() });
-          link.start();
-          hostLobby(link);
-          return null;
-        } catch (e) { return (e as Error).message; }
+        link = new HostLink(newRoomCode(), me.id, name, { status: 'lobby', hostId: me.id, builds, created: Date.now() });
+        link.start();
+        hostLobby(link);
+        return null;
       },
       onJoin: async (code, name) => {
         me.name = name; saveIdentity(me);
-        try {
-          await roomCall({ op: 'join', code, playerId: me.id, name });
-          guestLobby(code);
-          return null;
-        } catch (e) { return (e as Error).message; }
+        glink?.leave();
+        const l = new GuestLink(code, me);
+        glink = l;
+        const r = await l.connect(30000);
+        if (glink !== l) return null; // backed out meanwhile
+        if (r !== 'ok') {
+          l.leave();
+          glink = null;
+          return r === 'full' ? 'That room is full: 4 players already.'
+            : `Could not find room ${code}. Check the code, and make sure the host has the game open with the room on screen.`;
+        }
+        if (l.room?.meta.status === 'playing') startGuest(); else guestLobby();
+        return null;
       },
     });
   }
 
-  function lobbyPlayers(names: Record<string, string>, seen: Record<string, number>, hostId: string) {
-    return Object.entries(names).map(([id, name]) => ({ id, name, host: id === hostId, online: id === me.id || Date.now() - (seen[id] ?? 0) < 15000 }))
+  function lobbyPlayers(r: Pick<RoomInfo, 'names' | 'online'>, hostId: string) {
+    const online = new Set(r.online);
+    return Object.entries(r.names).map(([id, name]) => ({ id, name, host: id === hostId, online: id === me.id || online.has(id) }))
+      .filter((p) => p.online || p.host || Object.values(link?.seats ?? glink?.room?.seats ?? {}).includes(p.id))
       .sort((a, b) => Number(b.host) - Number(a.host));
   }
 
@@ -215,11 +226,8 @@ function isBuild(b: unknown): b is CharacterBuild {
     if (l.meta.builds) builds = l.meta.builds;
     l.setMeta({ status: 'lobby', builds });
     let lobby: LobbyView | null = null;
-    const refresh = () => lobby?.update({ players: lobbyPlayers({ [me.id]: me.name, ...l.names }, l.seen, me.id), seats: l.seats, builds, error: l.error || undefined });
-    const seat = (idx: number, take: boolean) => {
-      void roomCall({ op: 'seat', code: l.code, playerId: me.id, seat: idx, take, hostKey: l.hostKey, target: take ? me.id : l.seats[String(idx)] })
-        .then(() => l.sync()).then(refresh).catch((e) => lobby?.update({ players: [], seats: l.seats, builds, error: (e as Error).message }));
-    };
+    const refresh = () => lobby?.update({ players: lobbyPlayers({ names: l.names, online: l.onlineIds() }, me.id), seats: { ...l.seats }, builds, error: l.error || undefined });
+    const seat = (idx: number, take: boolean) => { l.setSeat(idx, take ? me.id : null); refresh(); };
     const editParty = (only?: number) => {
       lobby?.destroy();
       lobby = null;
@@ -241,85 +249,75 @@ function isBuild(b: unknown): b is CharacterBuild {
         const party = builds.map(buildCharacter);
         const world = newGame(party, omen);
         l.setMeta({ status: 'playing', builds });
-        saveHosting({ code: l.code, hostKey: l.hostKey, builds });
+        saveHosting({ code: l.code, builds, seats: l.seats });
         startDirector(world, false);
       },
       onLeave: () => { void endRoom(); title(); },
     });
     closeScreen = () => lobby?.destroy();
     refresh();
-    timers.push(window.setInterval(refresh, 1500));
   }
 
   async function endRoom(): Promise<void> {
     const l = link;
     if (!l) return;
     l.setMeta({ status: 'ended' });
-    try { await l.sync(); } catch { /* best effort */ }
-    l.stop();
     if (link === l) link = null;
     clearHosting();
+    // Give the goodbye a moment to reach everyone before closing the connections.
+    await new Promise((r) => setTimeout(r, 600));
+    l.stop();
   }
 
-  function guestLobby(code: string): void {
-    teardown(true);
+  function guestLobby(): void {
+    const l = glink;
+    if (!l) { title(); return; }
+    teardown();
     view.root.visible = false;
-    let meta: RoomMeta | null = null;
     let lobby: LobbyView | null = null;
-    let names: Record<string, string> = {};
-    let seen: Record<string, number> = {};
-    let seats: Record<string, string> = {};
-    let error = '';
-    const refresh = () => meta && lobby?.update({ players: lobbyPlayers(names, seen, meta.hostId), seats, builds: meta.builds, error: error || undefined });
-    const poll = async () => {
-      try {
-        const r = await roomCall<{ meta: string; players: Record<string, string>; seats: Record<string, string>; seen: Record<string, string>; now: number }>({ op: 'lobby', code, playerId: me.id });
-        meta = JSON.parse(r.meta) as RoomMeta;
-        const skew = Date.now() - r.now;
-        names = {};
-        for (const [id, v] of Object.entries(r.players)) { try { names[id] = JSON.parse(v).name; } catch { names[id] = '?'; } }
-        seen = {};
-        for (const [id, t] of Object.entries(r.seen)) seen[id] = Number(t) + skew;
-        seats = r.seats;
-        error = '';
-        if (meta.status === 'playing') { startGuest(code); return; }
-        if (meta.status === 'ended') { title(); popups.localToast('The host closed the room.'); return; }
-      } catch (e) {
-        error = (e as Error).message;
-        if (e instanceof NetError && e.status === 404) { title(); popups.localToast('That room has closed.'); return; }
-      }
+    const refresh = () => {
+      const r = l.room;
+      if (!r || !lobby) return;
+      lobby.update({ players: lobbyPlayers(r, r.meta.hostId), seats: { ...r.seats }, builds: r.meta.builds, error: l.hostHere ? undefined : 'Lost the host. Reconnecting…' });
+    };
+    const onRoom = (r: RoomInfo) => {
+      if (r.meta.status === 'playing') { startGuest(); return; }
+      if (r.meta.status === 'ended') { title(); popups.localToast('The host closed the room.'); return; }
       refresh();
     };
+    l.onRoom = onRoom;
+    l.onHost = () => refresh();
     const seat = (idx: number, take: boolean) => {
-      void roomCall<{ ok: boolean }>({ op: 'seat', code, playerId: me.id, seat: idx, take })
-        .then((r) => { if (!r.ok) popups.localToast('Someone else just took that hero.'); return poll(); });
+      if (!l.send({ type: 'seat', seat: idx, take })) popups.localToast('Not connected to the host right now. Try again in a moment.');
     };
     const customize = (idx: number) => {
-      if (!meta?.builds) return;
+      const b = l.room?.meta.builds;
+      if (!b) return;
       lobby?.destroy();
       lobby = null;
       const back = () => openLobby(); // openLobby() closes this builder via closeScreen
-      closeScreen = showCreate((b) => {
-        void roomCall({ op: 'intent', code, playerId: me.id, intent: { type: 'build', idx, build: b[idx] } });
+      closeScreen = showCreate((nb) => {
+        if (!l.send({ type: 'build', idx, build: nb[idx] })) popups.localToast('Not connected to the host: your changes were not sent.');
         back();
-      }, back, { builds: meta.builds, only: idx, title: 'Your hero', doneLabel: 'Send to host' });
+      }, back, { builds: b, only: idx, title: 'Your hero', doneLabel: 'Send to host' });
     };
     const openLobby = () => {
       closeScreen?.();
-      lobby = new LobbyView({ code, me: me.id, isHost: false, onSeat: seat, onCustomize: customize, onLeave: () => title() });
+      lobby = new LobbyView({ code: l.code, me: me.id, isHost: false, onSeat: seat, onCustomize: customize, onLeave: () => title() });
       closeScreen = () => lobby?.destroy();
       refresh();
     };
     openLobby();
-    void poll();
-    timers.push(window.setInterval(() => void poll(), 1500));
+    if (l.room) onRoom(l.room);
   }
 
-  function startGuest(code: string): void {
-    teardown(true);
+  function startGuest(): void {
+    const l = glink;
+    if (!l) { title(); return; }
+    teardown();
     initAudio();
     view.root.visible = true;
-    guest = new GuestClient(app, view, dice, code, me, () => title(), () => guestLobby(code));
+    guest = new GuestClient(app, view, dice, l, me, () => title(), () => guestLobby());
     guest.start();
     if (import.meta.env.DEV) (window as unknown as { __guest: unknown }).__guest = guest;
   }

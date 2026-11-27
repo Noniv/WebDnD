@@ -1,6 +1,6 @@
 # Emberdeep: notes for Claude
 
-A mobile-first, browser-based, **5e-compatible** dungeon crawl (SRD 5.2.1, CC-BY-4.0). PixiJS v8 renders the map; the UI is DOM laid over it. Solo play, plus online co-op for 1–4 players. Hosted on the **Vercel free tier**: static site plus small functions in `api/`. README.md covers the player and deploy side; this file covers how to work on the code.
+A mobile-first, browser-based, **5e-compatible** dungeon crawl (SRD 5.2.1, CC-BY-4.0). PixiJS v8 renders the map; the UI is DOM laid over it. Solo play, plus online co-op for 1–4 players. Hosted on the **Vercel free tier**: static site plus small functions in `api/`. Co-op is peer-to-peer (WebRTC via `trystero`), with no game server or database. README.md covers the player and deploy side; this file covers how to work on the code.
 
 ## The user
 - Not a D&D expert. Explain rules in plain language and write in-game text the same way (see `plainSpell()` in `src/game/director.ts`). Always tell the player *why* something can't be done; never fail silently.
@@ -36,8 +36,8 @@ node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
   - `textures.ts`: loads the SVGs; anything missing gets a drawn fallback.
   - `tween.ts`: every animation and pause goes through `animate()` and is scaled by the global game speed (`setTimeScale`).
 - `src/ui/`: `hud.ts` (party plates, dock, sheets, dialogue, panels, turn-order strip), `create.ts` (party builder, abilities card), `lobby.ts`, `title.ts`, `sfx.ts` (procedural Web Audio), `dom.ts` (`h()` helper).
-- `src/net/`: co-op. `protocol.ts` (types), `host.ts` (HostLink + HostHud), `guest.ts` (GuestClient), `api.ts`.
-- `api/`: Vercel functions with the Node `(req, res)` signature, no dependencies. `room.js` plus `_store.js` (Upstash Redis via REST; **one Lua script per operation**, so one request is one billed command; in-memory fallback in dev; returns 503 on Vercel without Redis). `daily.js` (omen) uses `shared/omen.js`.
+- `src/net/`: co-op. `p2p.ts` (`Wire`: trystero room keyed by the 4-letter code, per-peer numbered messages delivered in order), `protocol.ts` (types incl. `WireMsg`), `host.ts` (HostLink + HostHud), `guest.ts` (GuestLink + GuestClient), `identity.ts` (persistent player id/name).
+- `api/`: Vercel functions with the Node `(req, res)` signature, no dependencies. `daily.js` (omen) uses `shared/omen.js`; `health.js`.
 - `public/art/`: tiles, tokens, portraits, icons, `ui/gold/*` (the filigree kit, mostly CSS border-image 9-slices). Generators live in `tools/art/*.cjs` and `tools/ui-gold/gen.cjs`.
 
 ## Key design rules (keep these true)
@@ -48,10 +48,13 @@ node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
 - **Saves:** GameState must stay JSON-serialisable. Bump `CONFIG.SAVE_VERSION` if its shape changes incompatibly.
 
 ## Co-op model (read before touching the director or HUD)
-- The host's browser runs everything. `HostLink.sync()` posts the snapshot `{state, vm}` and queued events about every 0.7 s and pulls intents. Guests poll about every 0.9 s, replay events (dice, moves, fx, toasts) and render the snapshot.
+- The host's browser runs everything. `HostLink.emit()` sends events to guests right away (batched per microtask); `flush()` sends the snapshot `{state, vm}` when it changed, at most every 150 ms, always after pending events. Guests replay events (dice, moves, fx, toasts) and apply snapshots strictly in arrival order (`Wire` re-orders by sequence number, since trystero can let a small message overtake a big one).
+- **Update state before animating.** Set `c.pos` (etc.) before awaiting the animation that shows it (see `walk()` and the presenter's `move`); otherwise a snapshot taken mid-animation sends the old position and the guest's token walks backwards.
+- Exploration movement is per player: `groupOf(pid)` (that player's heroes; everyone in solo), `leadIdx(pid)`, `useLead(pid)` before any action that reads `this.leader`. Plain walks don't set `busy`, so players can walk at once; scenes (`holdScene`: dialogue, den/boss triggers) stop every walker. When an action is refused, tell that player why (`tellPlayer` / `tellBusy`).
+- In combat the presenter's `roll`/`rolls` only log (no dice overlay, no `roll` event); outside combat they show the d20.
 - Prompts are routed by `hud.decider` (a player id). `HostHud.sheet/dialogue/choose` send the prompt to that player when they're remote and online, and otherwise show it locally. `ownerOf(creature)` tells you who controls a hero (seat owner, else the host). Set the decider when an interaction starts (`onTap(p, from)`, dock taps, `check()` rerolls, `p.choose(..., who)`).
 - **Anything new that the HUD shows must be mirrored:** add it to `ViewModel` (`protocol.ts`), record it in a `HostHud` override, and render it in `GuestClient.render()`. Visual events go through the presenter, which `emit()`s them. Map highlights are recorded in `view.marks` automatically.
-- Test co-op with two separate browser contexts (see below). Redis Lua scripts can't be tested locally against Upstash; run them against `fakeredis[lua]` (export `_LUA` from `api/_store.js`).
+- Test co-op with two separate browser contexts (see below). It needs internet access (public Nostr relays for discovery); joining takes about 3 s. A console error about one dead relay is normal; trystero uses the others.
 
 ## Verifying changes (do this, the user tests on a phone)
 - Use headless Chrome through **puppeteer-core installed in the scratchpad** (not in the project): `executablePath: 'C:/Program Files/Google/Chrome/Application/chrome.exe'`, args `--use-angle=swiftshader --enable-unsafe-swiftshader`, viewport about 360–390 wide, `isMobile: true, hasTouch: true`.

@@ -3,9 +3,8 @@
 import { CLASSES, SPECIES } from '../rules/content';
 import type { CharacterBuild } from '../rules/creature';
 import { clear, h, layer, token } from './dom';
+import { CODE_LETTERS as LETTERS } from '../net/p2p';
 import { sfx } from './sfx';
-
-const LETTERS = 'ACDEFHJKLMNPRTUVWXY';
 
 export interface CoopStartActions {
   onHost: (name: string) => Promise<string | null>;
@@ -43,7 +42,7 @@ export function showCoopStart(name: string, prefillCode: string, a: CoopStartAct
     const c = codeIn.value.trim().toUpperCase();
     if (c.length !== 4) { err.textContent = 'Room codes are 4 letters, like KFTR.'; codeIn.focus(); sfx.deny(); return; }
     if ([...c].some((ch) => !LETTERS.includes(ch))) { err.textContent = `"${c}" can't be a room code: codes never use B, G, I, O, Q, S or Z.`; sfx.deny(); return; }
-    busy(true); err.textContent = 'Joining…';
+    busy(true); err.textContent = `Looking for room ${c}… this can take a few seconds.`;
     const e = await a.onJoin(c, n);
     busy(false); err.textContent = e ?? '';
   };

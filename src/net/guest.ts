@@ -1,112 +1,159 @@
-// Guest side of co-op: polls the room, replays the host's events (dice, moves, effects),
-// renders the same map and HUD, and sends taps/choices back as intents.
+// Guest side of co-op: a peer-to-peer link to the host, plus the client that replays the
+// host's events (dice, moves, effects) in order, renders the same map and HUD, and sends
+// taps/choices back as intents.
 import type { Application } from 'pixi.js';
 import type { Creature } from '../rules/creature';
 import { computeVisible } from '../game/grid';
-import { loadWorld, type GameState, type World } from '../game/state';
+import { invSummary, loadWorld, type GameState, type World } from '../game/state';
 import type { DiceOverlay } from '../render/dice';
 import { playFx, showDamage, showHeal } from '../render/fx';
 import type { MapView } from '../render/view';
 import { h } from '../ui/dom';
 import { Hud, type SheetOption } from '../ui/hud';
 import { sfx } from '../ui/sfx';
-import { NetError, roomCall, type Identity } from './api';
-import type { Intent, NetEvent, PromptSpec, RoomMeta, Snapshot } from './protocol';
+import type { Identity } from './identity';
+import { Wire } from './p2p';
+import type { Intent, NetEvent, PromptSpec, RoomInfo, Snapshot, WireMsg } from './protocol';
 
 type QItem = { ev: NetEvent } | { snap: Snapshot };
 
-interface PollResult {
-  sv: number; state: string | null; events: string[]; meta: string; players: Record<string, string>;
-  seats: Record<string, string>; seen: Record<string, string>; evLen: number; now: number;
+/** A guest's connection to a room. Lives from the lobby through the game. */
+export class GuestLink {
+  readonly code: string;
+  private me: Identity;
+  private wire: Wire;
+  private hostPeer: string | null = null;
+  room: RoomInfo | null = null;
+  full = false;
+  onRoom: (r: RoomInfo) => void = () => {};
+  onGame: (m: Extract<WireMsg, { t: 'evs' | 'snap' }>) => void = () => {};
+  onHost: (present: boolean) => void = () => {};
+  private waiters: (() => void)[] = [];
+
+  constructor(code: string, me: Identity) {
+    this.code = code;
+    this.me = me;
+    const w = new Wire(code);
+    this.wire = w;
+    w.onJoin = (peer) => w.send({ t: 'hello', id: me.id, name: me.name, role: 'guest' }, peer);
+    w.onMsg = (m, peer) => {
+      if (m.t === 'hello') {
+        if (m.role === 'host') { this.hostPeer = peer; this.onHost(true); }
+        return;
+      }
+      if (peer !== this.hostPeer) return; // only the host speaks for the room
+      if (m.t === 'room') { this.room = m.room; this.onRoom(m.room); this.wake(); }
+      else if (m.t === 'full') { this.full = true; this.wake(); }
+      else if (m.t === 'evs' || m.t === 'snap') this.onGame(m);
+    };
+    w.onLeave = (peer) => { if (peer === this.hostPeer) { this.hostPeer = null; this.onHost(false); } };
+  }
+
+  get hostHere(): boolean { return this.hostPeer !== null; }
+  get myId(): string { return this.me.id; }
+
+  private wake(): void { this.waiters.splice(0).forEach((f) => f()); }
+
+  /** Wait until the host has let us in (or said the room is full). */
+  async connect(timeoutMs: number): Promise<'ok' | 'full' | 'timeout'> {
+    if (!this.room && !this.full) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, timeoutMs);
+        this.waiters.push(() => { clearTimeout(t); resolve(); });
+      });
+    }
+    return this.full ? 'full' : this.room ? 'ok' : 'timeout';
+  }
+
+  /** Returns false when the host isn't connected right now. */
+  send(intent: Intent): boolean {
+    if (!this.hostPeer) return false;
+    this.wire.send({ t: 'intent', intent }, this.hostPeer);
+    return true;
+  }
+
+  leave(): void {
+    this.onRoom = () => {};
+    this.onGame = () => {};
+    this.onHost = () => {};
+    this.wire.leave();
+  }
 }
 
 export class GuestClient {
   private view: MapView;
   private dice: DiceOverlay;
-  private code: string;
+  private link: GuestLink;
   private me: Identity;
   private hud = new Hud();
   private world: World | null = null;
   private snap: Snapshot | null = null;
-  private sv = 0;
-  private evIdx = -1;
   private queue: QItem[] = [];
   private pumping = false;
   private running = false;
-  private timer = 0;
   private shownPrompt: string | null = null;
   private endShown = false;
-  private hostSeen = Date.now();
-  private warnedHost = false;
+  private awayTimer = 0;
   private lastFocus = '';
   private onLeave: () => void;
   private onLobby: () => void;
 
-  constructor(app: Application, view: MapView, dice: DiceOverlay, code: string, me: Identity, onLeave: () => void, onLobby: () => void) {
+  constructor(app: Application, view: MapView, dice: DiceOverlay, link: GuestLink, me: Identity, onLeave: () => void, onLobby: () => void) {
     this.onLobby = onLobby;
     void app;
     this.view = view;
     this.dice = dice;
-    this.code = code;
+    this.link = link;
     this.me = me;
     this.onLeave = onLeave;
     view.smoothMoves = true;
     view.onTap = (p) => this.tap(p);
     this.hud.onSelect = (i) => this.selectHero(i);
     this.hud.onSheet = (c) => this.hud.showCharacter(c);
-    this.hud.log(`Joined room ${code}. Waiting for the host…`);
+    this.hud.log(`Joined room ${link.code}. Waiting for the host…`);
     this.hud.setDock([{ id: 'wait', label: 'Connecting…', icon: 'end_turn', off: true, onTap: () => {} }]);
   }
 
   start(): void {
     this.running = true;
-    const loop = async () => {
+    const l = this.link;
+    l.onGame = (m) => {
       if (!this.running) return;
-      try { await this.poll(); } catch (e) {
-        if (e instanceof NetError && e.status === 404) { this.ended('The room has closed.'); return; }
-      }
-      this.timer = window.setTimeout(loop, document.hidden ? 5000 : this.queue.length > 4 ? 1500 : 900);
+      // Events that arrive before the first snapshot are already part of it.
+      if (m.t === 'evs') { if (this.world || this.queue.some((q) => 'snap' in q)) for (const ev of m.evs) this.queue.push({ ev }); }
+      else this.queue.push({ snap: m.snap });
+      void this.pump();
     };
-    void loop();
+    l.onRoom = (r) => this.roomChanged(r);
+    l.onHost = (here) => {
+      clearTimeout(this.awayTimer);
+      if (here) { this.hud.localToast('The host is back.'); return; }
+      // Brief drops (the host's phone locking) are common: only say so if it lasts.
+      this.awayTimer = window.setTimeout(() => {
+        if (this.running && !this.link.hostHere) this.hud.showBanner('The host is away', 'Waiting for them to come back. The game resumes on its own.', 6000);
+      }, 4000);
+    };
+    if (l.room) this.roomChanged(l.room);
   }
 
   destroy(): void {
     this.running = false;
-    clearTimeout(this.timer);
+    clearTimeout(this.awayTimer);
+    this.link.onGame = () => {};
+    this.link.onRoom = () => {};
+    this.link.onHost = () => {};
     this.hud.destroy();
     this.view.smoothMoves = false;
   }
 
-  private send(intent: Intent): void {
-    void roomCall({ op: 'intent', code: this.code, playerId: this.me.id, intent }).catch(() => {
-      this.hud.localToast('Connection hiccup: tap again');
-    });
+  private roomChanged(r: RoomInfo): void {
+    if (!this.running) return;
+    if (r.meta.status === 'ended') this.ended('The host ended the session.');
+    else if (r.meta.status === 'lobby') { this.running = false; this.onLobby(); }
   }
 
-  // ---------- Polling ----------
-
-  private async poll(): Promise<void> {
-    const r = await roomCall<PollResult>({ op: 'poll', code: this.code, playerId: this.me.id, sv: this.sv, from: Math.max(0, this.evIdx) });
-    const meta = JSON.parse(r.meta) as RoomMeta;
-    const skew = Date.now() - r.now;
-    this.hostSeen = Number(r.seen[meta.hostId] ?? 0) + skew;
-    if (meta.status === 'ended') { this.ended('The host ended the session.'); return; }
-    if (meta.status === 'lobby') { this.running = false; this.onLobby(); return; }
-    if (this.evIdx < 0) {
-      // Joining mid-game: skip history, start from now.
-      this.evIdx = r.evLen;
-    } else {
-      for (const e of r.events) { try { this.queue.push({ ev: JSON.parse(e) }); } catch { /* skip */ } }
-      this.evIdx += r.events.length;
-    }
-    if (r.state) {
-      this.sv = r.sv;
-      try { this.queue.push({ snap: JSON.parse(r.state) }); } catch { /* skip */ }
-    }
-    const away = Date.now() - this.hostSeen > 20000;
-    if (away && !this.warnedHost) { this.warnedHost = true; this.hud.showBanner('The host is away', 'Waiting for them to come back. The game resumes on its own.', 6000); }
-    if (!away) this.warnedHost = false;
-    void this.pump();
+  private send(intent: Intent): void {
+    if (!this.link.send(intent)) this.hud.localToast('Not connected to the host right now. Try again in a moment.');
   }
 
   private async pump(): Promise<void> {
@@ -150,14 +197,15 @@ export class GuestClient {
         const steps = ev.steps.map((s) => ({ c: this.byId(s.id)!, to: s.to })).filter((s) => s.c);
         await this.view.moveGroup(steps, behind ? 30 : ev.ms);
         for (const s of steps) s.c.pos = { ...s.to };
-        if (steps[0] && this.view.following) this.view.focus(steps[0].to);
+        // The camera follows my own heroes, not everyone else's walks.
+        if (steps[0] && this.view.following && this.myHeroes().some((c) => c.id === steps[0].c.id)) this.view.focus(steps[0].to);
         this.refreshFog();
         break;
       }
       case 'fx': if (!behind) await playFx(this.view, ev.kind, ev.from, ev.to); break;
       case 'shake': this.view.shake(ev.n); break;
       case 'banner': this.hud.showBanner(ev.title, ev.text, ev.ms); break;
-      case 'toast': this.hud.localToast(ev.text); break;
+      case 'toast': if (!ev.to || ev.to === this.me.id) this.hud.localToast(ev.text); break;
       case 'panel': {
         const body = h('div', {}, ...ev.lines.map((l) => h('p', { class: 'feat' }, l)));
         void this.hud.openPanel(ev.title, body, true);
@@ -213,13 +261,16 @@ export class GuestClient {
     const multi = Object.keys(vm.names).length > 1;
     this.hud.owners = {};
     if (multi) for (const c of state.party) { const pid = vm.owners[c.id]; this.hud.owners[c.id] = { name: vm.names[pid] ?? 'Host', me: pid === this.me.id }; }
-    this.hud.renderParty(state.party, vm.leader, vm.turnId);
+    // While exploring, highlight the hero I lead (every player moves their own heroes).
+    const myLead = vm.leads?.[this.me.id] ?? state.party.findIndex((c) => vm.owners[c.id] === this.me.id);
+    const shownLead = vm.mode === 'explore' && myLead >= 0 ? myLead : vm.leader;
+    this.hud.renderParty(state.party, shownLead, vm.turnId);
     this.hud.setChips(vm.chips);
     this.hud.setTurnbar(vm.turnbar);
     this.hud.setOrder(vm.order ?? null);
     this.view.insets = this.hud.insets();
     this.view.applyMarks(vm.marks);
-    const activeId = vm.turnId ?? state.party[vm.leader]?.id ?? null;
+    const activeId = vm.turnId ?? state.party[shownLead]?.id ?? null;
     this.view.setActive(activeId);
 
     // Dock
@@ -237,8 +288,8 @@ export class GuestClient {
       ]);
     }
 
-    // Camera: my hero on my turn, otherwise whoever acts / leads.
-    const focusId = vm.turnId ?? state.party[vm.leader]?.id;
+    // Camera: whoever acts in combat, otherwise the hero I lead.
+    const focusId = vm.turnId ?? state.party[shownLead]?.id;
     const focusC = state.party.find((c) => c.id === focusId) ?? state.monsters.find((c) => c.id === focusId);
     const key = `${vm.mode}:${focusId}`;
     if (focusC && (first || key !== this.lastFocus || this.view.following)) { this.lastFocus = key; this.view.focus(focusC.pos, first); }
@@ -314,13 +365,15 @@ export class GuestClient {
 
   private async menu(): Promise<void> {
     const r = await this.hud.sheet<string>({
-      title: `Room ${this.code}`, options: [
+      title: `Room ${this.link.code}`, options: [
+        { label: 'Inventory', sub: this.snap ? invSummary(this.snap.state.inv) : undefined, value: 'inv', icon: 'potion' },
         { label: 'Journal', value: 'log', icon: 'sheet' },
         { label: 'My hero sheet', value: 'sheet', icon: 'sheet', disabled: this.myHeroes().length ? undefined : 'You are watching' },
         { label: 'Leave the room', sub: 'You can rejoin with the same code.', value: 'leave', icon: 'close' },
       ],
     });
     if (!r) return;
+    if (r.value === 'inv' && this.snap) this.hud.showInventory(this.snap.state.inv);
     if (r.value === 'log') this.hud.showLog();
     if (r.value === 'sheet') this.hud.showCharacter(this.myHeroes()[0]);
     if (r.value === 'leave') this.onLeave();

@@ -11,6 +11,7 @@ import { condIcon } from '../render/view';
 import { clear, esc, h, icon, layer, portrait, token } from './dom';
 import { sfx } from './sfx';
 import { getTimeScale } from '../render/tween';
+import type { Inventory } from '../game/state';
 
 export interface DockBtn {
   id: string;
@@ -173,6 +174,19 @@ export class Hud {
   showLog(): void {
     const body = h('div', { class: 'logfull' }, ...this.logLines.slice(-60).reverse().map((l) => h('p', { class: l.tone }, l.msg)));
     void this.openPanel('Journal', body);
+  }
+
+  /** The party's shared packs, with a plain-language line on what each thing is for. */
+  showInventory(inv: Inventory): void {
+    const row = (ic: string, name: string, text: string) =>
+      h('div', { class: 'inv-row' }, icon(ic, 'inv-ic'), h('p', { class: 'feat' }, h('b', {}, name), ` ${text}`));
+    const rows: HTMLElement[] = [];
+    if (inv.potions > 0) rows.push(row('potion', `Potion of Healing ×${inv.potions}.`, 'Restores 2d4 + 2 hit points, even to a hero who is down. Use the Potion button.'));
+    if (inv.keys.length) rows.push(row('key', 'Crypt key.', 'Opens the locked door to the crypt.'));
+    if (inv.phial > 0) rows.push(row('turn_undead', 'Ember Phial.', 'Holy fire in a bottle. Throw it to douse the Ash Warden\'s brazier, so it stops healing him.'));
+    if (inv.gold > 0) rows.push(row('gold', `${inv.gold} gold pieces.`, 'Loot. It counts toward your final tally.'));
+    if (!rows.length) rows.push(h('p', { class: 'feat' }, 'Your packs are empty. Search rooms and open chests to find things.'));
+    void this.openPanel('Inventory', h('div', { class: 'inv' }, ...rows));
   }
 
   // ---------- Dock ----------

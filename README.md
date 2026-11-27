@@ -19,29 +19,24 @@ Node 20+.
 
 1. Push this folder to a GitHub repository.
 2. In Vercel, choose **Add New → Project** and import the repo. Vercel detects Vite from `vercel.json`: build `npm run build`, output `dist/`.
-3. Deploy. Solo play works immediately.
-4. **For co-op**, add a free Redis database (one time, about a minute):
-   - In the Vercel project, open **Storage → Create Database → Upstash for Redis** (free plan), and connect it to this project.
-   - This adds `KV_REST_API_URL` and `KV_REST_API_TOKEN` to the project's environment variables. `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` also work if you create the database on upstash.com yourself.
-   - **Redeploy** so the functions pick up the variables.
+3. Deploy. Solo and co-op both work immediately: co-op needs no database or server setup.
 
-Why a database: Vercel functions are stateless and can't hold WebSocket connections, so the room has to live somewhere between requests. Without Redis on Vercel, the co-op screen says exactly what to set up instead of half-working. Locally, `npm run dev` keeps rooms in memory, so co-op works with no setup.
-
-The server is three dependency-free functions in `api/`:
+The server is two dependency-free functions in `api/`:
 
 | Route | What it does |
 | --- | --- |
 | `GET /api/daily[?date=YYYY-MM-DD]` | Today's *omen* and map seed. The omen is a small deterministic twist, e.g. *Still Air* (traps easier to spot) or *Restless Dead* (the boss has more HP). It is edge-cached for an hour. |
 | `GET /api/health` | Liveness probe. |
-| `POST /api/room` | Co-op rooms: create, join, seats, lobby, poll, intents and host sync. Every operation is a single Redis Lua script, so one request costs one Upstash command. |
 
 ### How co-op works
 
-- **The host's browser runs the game.** It is the only place the rules and dice run, so everyone sees the same rolls. The host publishes a snapshot (game state + what each screen should show) and a stream of events (dice, moves, effects, log lines) about every 0.7 s.
-- **Guests mirror it.** They poll about every 0.9 s, replay the events (the same d20 animations, token moves and effects), render the same map with their own fog-of-war view, and send *intents* back: taps on the map, dock buttons, and answers to prompts.
-- **Each choice goes to the right player.** Whoever controls a hero takes that hero's combat turn and makes their checks, reactions (Shield) and rerolls. Whoever walks the party into a conversation speaks for it; the others watch the dialogue read-only. Heroes nobody claimed are played by the host. If a player drops, the host can **Decide for them**, and that hero falls back to the host after 15 s offline.
-- **Lobby.** The host gets a 4-letter code (no look-alike letters) and an invite link (`?join=CODE`). Players join, pick a hero, and can customise it; the host edits the party and presses Start. Up to 4 players per room.
-- **Free-tier budget.** Each connected device costs about 4,000–5,000 Upstash commands per hour of play (one command per poll), so a full 4-player table uses roughly 16,000–20,000 per hour. Compare that with Upstash's current free quota; polling slows to every 4–5 s in background tabs. Rooms expire 8 hours after their last write.
+- **Peer-to-peer, no server.** Players' browsers connect to each other directly (WebRTC, via the [trystero](https://github.com/dmotz/trystero) library). They find each other through public Nostr relays using only the room code, so nobody swaps connection codes and nothing is stored on a server. Joining usually takes a few seconds.
+- **The host's browser runs the game.** It is the only place the rules and dice run, so everyone sees the same rolls. It streams events (dice, moves, effects, log lines) the moment they happen, plus a snapshot of the game state a few times a second. Every message is numbered, so guests apply them in exactly the order the host made them.
+- **Guests mirror it.** They replay the events (the same d20 animations, token moves and effects), render the same map with their own fog-of-war view, and send *intents* back: taps on the map, dock buttons, and answers to prompts.
+- **Each player moves their own heroes.** While exploring, a tap moves only the heroes you control (your chosen lead in front, the rest following), and several players can walk at once. Conversations and sprung traps pause everyone.
+- **Each choice goes to the right player.** Whoever controls a hero takes that hero's combat turn and makes their checks, reactions (Shield) and rerolls. Whoever walks into a conversation speaks for the party; everyone else sees it read-only. Heroes nobody claimed are played by the host. If a player disconnects, their heroes fall back to the host, who can also **Decide for them** on a pending choice.
+- **Lobby.** The host gets a 4-letter code (no look-alike letters) and an invite link (`?join=CODE`). Players join, pick a hero, and can customise it; the host edits the party and presses Start. Up to 4 players per room. The host can reload and *Continue hosting* the same room.
+- **Strict networks.** A few mobile networks block direct connections between phones. If a friend can never join, add a TURN relay: set `VITE_TURN_URLS` (comma-separated `turn:`/`turns:` URLs), `VITE_TURN_USERNAME` and `VITE_TURN_CREDENTIAL` in the Vercel project's environment variables and redeploy. Several providers have free tiers.
 
 If `/api/daily` can't be reached (offline, or a static host), the client works out the same omen locally from `shared/omen.js`, so the game never breaks.
 
@@ -82,7 +77,7 @@ If `/api/daily` can't be reached (offline, or a static host), the client works o
 | Crypt door | Snikk's key, pick the lock, or force it (loud: alerts the crypt) |
 | The Ash Warden | Fight it while its brazier heals it, or douse the brazier (Arcana, Athletics, cold damage, or the Ember Phial from the secret nook). Turn Undead stops the skeletons, bludgeoning breaks the Warden's bones, and the shrine is a refuge because undead can't enter the candle's light. The secret Sister Passage lets you ambush it. |
 
-**Co-op.** Online play for 1–4 players with a lobby, seats and invite links. See "How co-op works" above.
+**Co-op.** Online peer-to-peer play for 1–4 players with a lobby, seats and invite links. See "How co-op works" above.
 
 **Saves.** Progress autosaves at room entries, rests and fight outcomes (localStorage, versioned). *Continue* resumes, and a defeat offers a retry from the last checkpoint.
 
@@ -105,12 +100,12 @@ Brute force can win, but engaging the systems (the brazier, the phial from the s
 ## Project layout
 
 ```
-api/            Vercel serverless functions (daily omen, health, co-op rooms + Redis store)
+api/            Vercel serverless functions (daily omen, health)
 shared/         Code shared by server and client (omen)
 src/rules/      Pure 5e-compatible rules: dice, checks, creatures, classes, spells, monsters
 src/game/       Dungeon, state, grid (LOS/fog/pathing), combat engine, dialogue, director (the "DM")
 src/render/     PixiJS: map view, tokens, fog, effects, d20 overlay, textures
-src/net/        Co-op: protocol, host link + mirrored HUD, guest client
+src/net/        Co-op: P2P wire (p2p.ts), protocol, host link + mirrored HUD, guest link + client
 src/ui/         DOM HUD, title, party builder, lobby, procedural Web Audio sound
 public/art/     Hand-authored SVGs (tiles, tokens, portraits, icons, gold filigree UI kit)
 tools/art/      Scripts that generate and validate the SVG set (node tools/art/tiles.cjs, ...)

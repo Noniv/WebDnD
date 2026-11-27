@@ -18,7 +18,8 @@ export type Intent =
   | { type: 'dock'; id: string }
   | { type: 'answer'; pid: string; index: number | null; actorId: string | null }
   | { type: 'leader'; idx: number }
-  | { type: 'build'; idx: number; build: CharacterBuild };
+  | { type: 'build'; idx: number; build: CharacterBuild }
+  | { type: 'seat'; seat: number; take: boolean };
 export type IncomingIntent = Intent & { from: string; t: number };
 
 export type FxKind = 'slash' | 'arrow' | 'bolt' | 'fire' | 'frost' | 'radiant' | 'heal' | 'force' | 'sleep' | 'darts' | 'turn' | 'douse';
@@ -35,7 +36,7 @@ export type NetEvent =
   | { k: 'fx'; kind: FxKind; from: Pos; to: Pos | Pos[] }
   | { k: 'shake'; n: number }
   | { k: 'banner'; title: string; text: string; ms: number }
-  | { k: 'toast'; text: string }
+  | { k: 'toast'; text: string; to?: string }
   | { k: 'panel'; title: string; lines: string[] }
   | { k: 'levelup'; reports: { name: string; from: number; to: number; hpGain: number; gains: string[] }[] }
   | { k: 'show'; to: string; what: 'creature' | 'character'; id: string; extra?: string[] };
@@ -75,6 +76,8 @@ export interface EndSpec { title: string; text: string; lines: string[]; emblem:
 export interface ViewModel {
   mode: 'explore' | 'combat' | 'end';
   leader: number;
+  /** Player id -> index of the hero they lead while exploring (each player moves their own heroes). */
+  leads: Record<string, number>;
   turnId: string | null;
   chips: ChipSpec[];
   turnbar: { name: string; move: number; actions: number; bonus: boolean; reaction: boolean; round: number } | null;
@@ -91,3 +94,26 @@ export interface ViewModel {
 }
 
 export interface Snapshot { state: GameState; vm: ViewModel }
+
+/** Lobby/room info the host broadcasts to every guest. */
+export interface RoomInfo {
+  meta: RoomMeta;
+  /** Player id -> name (host included). */
+  names: Record<string, string>;
+  /** Seat index -> player id. */
+  seats: Record<string, string>;
+  /** Player ids connected right now. */
+  online: string[];
+}
+
+/**
+ * Everything on the peer-to-peer wire. One ordered, reliable channel per peer, so
+ * events and snapshots arrive in exactly the order the host produced them.
+ */
+export type WireMsg =
+  | { t: 'hello'; id: string; name: string; role: 'host' | 'guest' }
+  | { t: 'room'; room: RoomInfo }
+  | { t: 'full' }
+  | { t: 'evs'; evs: NetEvent[] }
+  | { t: 'snap'; snap: Snapshot }
+  | { t: 'intent'; intent: Intent };

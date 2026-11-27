@@ -15,6 +15,16 @@ export interface Inventory {
   phial: number;
 }
 
+/** One line for menus: "2 potions · crypt key · 15 gp". */
+export function invSummary(inv: Inventory): string {
+  const parts: string[] = [];
+  if (inv.potions) parts.push(`${inv.potions} potion${inv.potions > 1 ? 's' : ''}`);
+  if (inv.keys.length) parts.push('crypt key');
+  if (inv.phial) parts.push('Ember Phial');
+  if (inv.gold) parts.push(`${inv.gold} gp`);
+  return parts.length ? parts.join(' · ') : 'Empty';
+}
+
 export interface GameState {
   version: number;
   omen: OmenData;
