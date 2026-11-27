@@ -1,0 +1,26 @@
+{
+  "name": "emberdeep",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Emberdeep - a 5e-compatible, mobile-first browser dungeon delve built with PixiJS.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "sim": "vite build --ssr scripts/sim.ts --outDir node_modules/.sim --emptyOutDir --logLevel warn && node node_modules/.sim/sim.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pixi.js": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/web": "^0.0.352",
+    "typescript": "^7.0.2",
+    "vite": "^8.4.0"
+  }
+}
