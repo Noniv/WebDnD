@@ -11,10 +11,10 @@ import { dist } from '../src/game/state';
 
 type Strategy = 'brawl' | 'sleep' | 'douse' | 'ignore' | 'phial' | 'turn';
 
-function makeWorld(level: number): World {
+function makeWorld(level: number, area: 'deep1' | 'road' | 'deep2' = 'deep1'): World {
   const party = (['fighter', 'rogue', 'wizard', 'cleric'] as const).map((c, i) => buildCharacter(defaultBuild(c, i)));
   const omen = { date: 'sim', seed: 1, omen: { id: 'quiet', name: 'Quiet', text: '', mods: {} } };
-  const w = newGame(party, omen);
+  const w = newGame(party, omen, area);
   if (level > 1) for (const c of party) { c.xp = 300; levelUp(c); longRest(c); }
   return w;
 }
@@ -90,6 +90,27 @@ function policy(cb: Combat, strat: Strategy, phial: { n: number }) {
   };
 }
 
+/** The side fights added with the village: where they happen and at what level players usually meet them. */
+const SIDE: Record<string, { area: 'road' | 'deep2'; level: number; group: string; spots: [number, number][]; surprised: 'party' | 'enemies' | null }> = {
+  'wolves-ambush': { area: 'road', level: 1, group: 'wolves', spots: [[7, 17], [8, 17], [6, 18], [7, 18]], surprised: 'party' },
+  'wolves-warned': { area: 'road', level: 1, group: 'wolves', spots: [[7, 17], [8, 17], [6, 18], [7, 18]], surprised: 'enemies' },
+  rats: { area: 'deep2', level: 1, group: 'rats', spots: [[5, 17], [5, 16], [4, 17], [4, 18]], surprised: null },
+  spider: { area: 'deep2', level: 2, group: 'spider', spots: [[7, 7], [6, 7], [7, 8], [6, 8]], surprised: null },
+  drowned: { area: 'deep2', level: 2, group: 'drowned', spots: [[11, 7], [12, 7], [11, 6], [12, 6]], surprised: null },
+};
+
+async function sideFight(kind: string, seed: number) {
+  seedRng(seed);
+  const f = SIDE[kind];
+  const w = makeWorld(f.level, f.area);
+  place(w, f.spots);
+  const cb = new Combat(w, headless);
+  cb.pcAuto = policy(cb, 'brawl', { n: 0 });
+  await cb.start(w.state.monsters.filter((m) => m.group === f.group), f.surprised);
+  const out = await cb.run();
+  return { win: out === 'victory', rounds: cb.round, dead: w.state.party.filter((c) => c.death.dead).length, down: w.state.party.filter((c) => c.hp <= 0).length };
+}
+
 async function fight(kind: 'den' | 'boss', strat: Strategy, seed: number) {
   seedRng(seed);
   const w = makeWorld(kind === 'den' ? 1 : 2);
@@ -124,5 +145,15 @@ const cases: [kind: 'den' | 'boss', strat: Strategy][] = [
       rounds += r.rounds; dead += r.dead; down += r.down;
     }
     console.log(`${kind.padEnd(6)} ${strat.padEnd(9)} ${(wins / N * 100).toFixed(0).padStart(4)}%  ${(rounds / N).toFixed(1).padStart(8)}  ${(dead / N).toFixed(2).padStart(9)}  ${(down / N).toFixed(2).padStart(9)}`);
+  }
+  console.log('\nside fights (brawl)        win%   avgRounds  avgDeaths  avgDowned');
+  for (const kind of Object.keys(SIDE)) {
+    let wins = 0, rounds = 0, dead = 0, down = 0;
+    for (let i = 0; i < N; i++) {
+      const r = await sideFight(kind, 2000 + i * 7919);
+      if (r.win) wins++;
+      rounds += r.rounds; dead += r.dead; down += r.down;
+    }
+    console.log(`${`${kind} (lv ${SIDE[kind].level})`.padEnd(26)} ${(wins / N * 100).toFixed(0).padStart(4)}%  ${(rounds / N).toFixed(1).padStart(8)}  ${(dead / N).toFixed(2).padStart(9)}  ${(down / N).toFixed(2).padStart(9)}`);
   }
 })();

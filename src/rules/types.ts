@@ -63,7 +63,7 @@ export const CONDITION_INFO: Record<ConditionId, { name: string; icon: string; t
   aimed: { name: 'Steady Aim', icon: 'steady_aim', text: 'Advantage on your next attack this turn.' },
 };
 
-export type Faction = 'party' | 'goblins' | 'undead' | 'object';
+export type Faction = 'party' | 'goblins' | 'undead' | 'beasts' | 'object' | 'npc';
 
 export interface Weapon {
   id: string;

@@ -19,7 +19,9 @@ export type Intent =
   | { type: 'answer'; pid: string; index: number | null; actorId: string | null }
   | { type: 'leader'; idx: number }
   | { type: 'build'; idx: number; build: CharacterBuild }
-  | { type: 'seat'; seat: number; take: boolean };
+  | { type: 'seat'; seat: number; take: boolean }
+  /** A line in an AI-run conversation (null text = leave / continue). */
+  | { type: 'say'; talk: string; ask: number; text: string | null; actorId: string | null };
 export type IncomingIntent = Intent & { from: string; t: number };
 
 export type FxKind = 'slash' | 'arrow' | 'bolt' | 'fire' | 'frost' | 'radiant' | 'heal' | 'force' | 'sleep' | 'darts' | 'turn' | 'douse';
@@ -73,6 +75,29 @@ export interface PromptSpec {
 
 export interface EndSpec { title: string; text: string; lines: string[]; emblem: boolean }
 
+export interface TalkLine { who: 'npc' | 'hero' | 'roll' | 'note'; name?: string; text: string; ok?: boolean }
+
+/** An AI-run conversation, as every screen draws it. */
+export interface TalkVM {
+  id: string;
+  npc: { name: string; title: string; portrait: string };
+  lines: TalkLine[];
+  /** Player whose turn it is to speak (or to press Continue). */
+  turn: string | null;
+  /** Bumped every time a new answer is awaited, so late answers are ignored. */
+  ask: number;
+  thinking: boolean;
+  /** The dice are on screen: hide the panel. */
+  rolling: boolean;
+  suggestions: string[];
+  /** Heroes who may speak. */
+  partyIds: string[];
+  actorId: string | null;
+  /** The last line is up: Continue closes. */
+  done: boolean;
+  leaveLabel: string;
+}
+
 export interface ViewModel {
   mode: 'explore' | 'combat' | 'end';
   leader: number;
@@ -86,6 +111,7 @@ export interface ViewModel {
   dock: { for: string | null; buttons: DockSpec[] };
   marks: Marks;
   prompt: PromptSpec | null;
+  talk: TalkVM | null;
   end: EndSpec | null;
   /** Hero id -> player id. */
   owners: Record<string, string>;

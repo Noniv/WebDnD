@@ -12,8 +12,8 @@ function tornOval(seed) {
   }
   return 'M' + pts.join(' L') + ' Z';
 }
-const XF = { ash_warden: [1.7, 12], wizard: [1.75, 4], goblin_boss: [1.8, 0] };
-const GLOW = { wizard: C.arc, ash_warden: C.e1, cleric: C.gold };
+const XF = { ash_warden: [1.7, 12], wizard: [1.75, 4], goblin_boss: [1.8, 0], guard: [1.72, 6], innkeeper: [1.82, -4] };
+const GLOW = { wizard: C.arc, ash_warden: C.e1, cleric: C.gold, priest: C.gold, child: C.e2, stranger: C.arc };
 function portrait(name, seed) {
   const id = `${name}-portrait`;
   const oval = tornOval(seed);
@@ -40,3 +40,5 @@ function portrait(name, seed) {
   return svg(200, 240, `<defs>${defs}</defs>${body}`);
 }
 ['fighter', 'rogue', 'wizard', 'cleric', 'goblin_boss', 'ash_warden'].forEach((n, i) => write(`portraits/${n}.svg`, portrait(n, 31 + i * 7)));
+// village NPCs
+['innkeeper', 'priest', 'smith', 'elder', 'child', 'guard', 'stranger', 'miner', 'hermit'].forEach((n, i) => write(`portraits/${n}.svg`, portrait(n, 83 + i * 7)));

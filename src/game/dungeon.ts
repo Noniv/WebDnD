@@ -1,10 +1,27 @@
 // The Emberdeep: five rooms carved into a 21×38 grid, plus a secret nook.
 // Built from code (rects + props) rather than ASCII so coordinates stay explicit.
+// The other areas (village, road, lower workings) live in areas.ts and share these types.
 import type { Pos } from '../rules/types';
 
-export type TileKind = 'wall' | 'floor' | 'crypt' | 'rubble';
+export type TileKind =
+  | 'wall' | 'floor' | 'crypt' | 'rubble'
+  // outdoors
+  | 'grass' | 'road' | 'dirt' | 'water' | 'housewall' | 'roof' | 'tree' | 'pine' | 'bush'
+  // the lower workings
+  | 'cave' | 'flooded';
 
-export type ObjKind = 'door' | 'secret' | 'chest' | 'cache' | 'trap' | 'shrine' | 'campfire' | 'stairs' | 'bones';
+export type AreaId = 'town' | 'road' | 'deep1' | 'deep2';
+
+export type ObjKind =
+  | 'door' | 'secret' | 'chest' | 'cache' | 'trap' | 'shrine' | 'campfire' | 'stairs' | 'bones'
+  /** A way to another area (`to`). */
+  | 'exit'
+  /** The inn door: rest and Marta's company. */
+  | 'inn'
+  /** A prisoner's cage. */
+  | 'cage'
+  /** Scenery with a texture (`prop`) and an inspect line; `blocks` stops movement. */
+  | 'decor';
 
 export interface MapObject {
   id: string;
@@ -27,6 +44,12 @@ export interface MapObject {
   armed?: boolean;
   /** Free-text shown when inspected. */
   text?: string;
+  /** Exits: where they lead. */
+  to?: { area: AreaId; at: Pos };
+  /** Texture key under tiles/ for exits and decor. */
+  prop?: string;
+  /** Decor that blocks movement (wells, stalls, anvils). */
+  blocks?: boolean;
 }
 
 export interface Room {
@@ -35,13 +58,22 @@ export interface Room {
   rect: { x: number; y: number; w: number; h: number };
   intro: string;
   safe?: boolean;
+  /** Entering starts this fight while any of its group stands. */
+  encounter?: string;
 }
 
-export interface Spawn { monsterId: string; pos: Pos; group: 'den' | 'crypt' }
+/** `group` ties monsters to a fight ('den', 'crypt', 'wolves'...), or 'npc' for people you talk to. */
+export interface Spawn { monsterId: string; pos: Pos; group: string }
 
 export interface Light { pos: Pos; r: number; color: number }
 
 export interface DungeonDef {
+  id: AreaId;
+  name: string;
+  /** Outdoors in daylight: everyone sees this many squares instead of torchlight. */
+  daylight?: number;
+  /** Whether the whole map starts explored (a village you know). */
+  known?: boolean;
   w: number;
   h: number;
   tiles: TileKind[][];
@@ -102,7 +134,12 @@ export function buildDungeon(): DungeonDef {
   ];
 
   const objects: MapObject[] = [
-    { id: 'stairs', kind: 'stairs', name: 'Stairs up', pos: { x: 9, y: 36 }, text: 'The way back to daylight. Not yet.' },
+    { id: 'stairs', kind: 'exit', name: 'Stairs up to the mine road', pos: { x: 9, y: 36 }, prop: 'stairs_up', to: { area: 'road', at: { x: 8, y: 3 } },
+      text: 'Broken steps climb back to the mine mouth and the forest road.' },
+    { id: 'shaft', kind: 'exit', name: 'Shaft to the old workings', pos: { x: 12, y: 35 }, prop: 'stairs_down', to: { area: 'deep2', at: { x: 3, y: 18 } },
+      text: 'A crumbling shaft the miners dug, dropping into flooded tunnels. Something splashes far below.' },
+    { id: 'cage', kind: 'cage', name: 'Prisoner cage', pos: { x: 14, y: 25 }, locked: true, lockDC: 13, forceDC: 15,
+      text: 'An iron cage chained to the wall. A filthy, frightened miner crouches inside.' },
     { id: 'cache', kind: 'cache', name: 'Loose flagstone', pos: { x: 11, y: 33 }, hidden: true, passiveDC: 12, searchDC: 10,
       loot: ['potion'], text: 'A flagstone that rocks underfoot. Someone hid something here.' },
     { id: 'door-den', kind: 'door', name: 'Heavy door', pos: { x: 9, y: 31 }, open: false,
@@ -145,7 +182,8 @@ export function buildDungeon(): DungeonDef {
     { pos: { x: 9, y: 11 }, r: 4, color: 0xf2a65a },
   ];
 
-  return { w: W, h: H, tiles, rooms, objects, spawns, lights, start: { x: 9, y: 34 } };
+  spawns.push({ monsterId: 'npc-miner', pos: { x: 14, y: 25 }, group: 'npc' });
+  return { id: 'deep1', name: 'The Emberdeep', w: W, h: H, tiles, rooms, objects, spawns, lights, start: { x: 9, y: 34 } };
 }
 
 export function inRect(p: Pos, r: Room['rect']): boolean {

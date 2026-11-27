@@ -217,4 +217,4 @@ function ashWarden(id, O, pt) {
   return { defs, clip, over };
 }
 
-module.exports = { fighter, rogue, wizard, cleric, goblin, goblin_boss: goblinBossFig, skeleton, ash_warden: ashWarden };
+module.exports = { fighter, rogue, wizard, cleric, goblin, goblin_boss: goblinBossFig, skeleton, ash_warden: ashWarden, ...require('./npcs.cjs') };

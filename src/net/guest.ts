@@ -5,6 +5,8 @@ import type { Application } from 'pixi.js';
 import type { Creature } from '../rules/creature';
 import { computeVisible } from '../game/grid';
 import { invSummary, loadWorld, type GameState, type World } from '../game/state';
+import { questLog, questSummary } from '../game/npcs';
+import { TalkPanel } from '../ui/talk';
 import type { DiceOverlay } from '../render/dice';
 import { playFx, showDamage, showHeal } from '../render/fx';
 import type { MapView } from '../render/view';
@@ -138,6 +140,7 @@ export class GuestClient {
 
   destroy(): void {
     this.running = false;
+    this.talk?.destroy();
     clearTimeout(this.awayTimer);
     this.link.onGame = () => {};
     this.link.onRoom = () => {};
@@ -182,7 +185,14 @@ export class GuestClient {
 
   private async play(ev: NetEvent, behind: boolean): Promise<void> {
     switch (ev.k) {
-      case 'roll': if (!behind) await this.dice.show(ev.r, ev.note); break;
+      case 'roll':
+        if (!behind) {
+          // The dice draw under the page: tuck a conversation away while they roll.
+          if (this.talk) this.talk.scrim.style.display = 'none';
+          await this.dice.show(ev.r, ev.note);
+          if (this.talk && !this.snap?.vm.talk?.rolling) this.talk.scrim.style.display = '';
+        }
+        break;
       case 'rolls': if (!behind) await this.dice.showMany(ev.rs, ev.title); break;
       case 'damage': { const c = this.byId(ev.id); if (c) showDamage(this.view, c, ev.amount, ev.crit, ev.note); break; }
       case 'heal': { const c = this.byId(ev.id); if (c) showHeal(this.view, c, ev.amount); break; }
@@ -225,12 +235,13 @@ export class GuestClient {
   // ---------- Snapshot ----------
 
   private apply(snap: Snapshot): void {
-    const first = !this.world;
     const state = snap.state as GameState;
-    if (!this.world) {
+    // A new area (or the first snapshot): rebuild the map.
+    const first = !this.world || this.world.state.area !== state.area;
+    if (first) {
       this.world = loadWorld(state);
       this.view.build(this.world);
-    } else {
+    } else if (this.world) {
       this.world.state = state;
       this.world.def.objects = state.objects;
     }
@@ -293,7 +304,13 @@ export class GuestClient {
     const focusC = state.party.find((c) => c.id === focusId) ?? state.monsters.find((c) => c.id === focusId);
     const key = `${vm.mode}:${focusId}`;
     if (focusC && (first || key !== this.lastFocus || this.view.following)) { this.lastFocus = key; this.view.focus(focusC.pos, first); }
-    if (first) this.hud.showBanner('You joined the delve', this.myHeroes().length ? `You play ${this.myHeroes().map((c) => c.name).join(' & ')}.` : 'You are watching. Take a hero in the lobby next time.', 5000);
+    if (first && !this.joined) {
+      this.joined = true;
+      this.hud.showBanner('You joined the delve', this.myHeroes().length ? `You play ${this.myHeroes().map((c) => c.name).join(' & ')}.` : 'You are watching. Take a hero in the lobby next time.', 5000);
+    }
+
+    // AI conversation
+    this.renderTalk();
 
     // Prompts
     const p = vm.prompt;
@@ -309,6 +326,34 @@ export class GuestClient {
       this.endShown = true;
       this.hud.endScreen({ ...vm.end, buttons: [{ label: 'Back to title', primary: true, onTap: () => this.onLeave() }] });
     }
+  }
+
+  private joined = false;
+  private talk: TalkPanel | null = null;
+  private talkSent = '';
+
+  private renderTalk(): void {
+    const t = this.snap?.vm.talk ?? null;
+    if (!t) { this.talk?.destroy(); this.talk = null; return; }
+    if (!this.talk) {
+      const answer = (text: string | null, actorId: string | null) => {
+        const cur = this.snap?.vm.talk;
+        if (!cur || cur.turn !== this.me.id) return;
+        this.talkSent = `${cur.id}:${cur.ask}`;
+        this.send({ type: 'say', talk: cur.id, ask: cur.ask, text, actorId });
+        this.renderTalk();
+      };
+      this.talk = new TalkPanel(this.hud.modal, {
+        onSend: (text, actorId) => answer(text, actorId),
+        onLeave: () => answer(null, null),
+        onContinue: () => answer(null, null),
+      });
+    }
+    const st = this.snap!.state;
+    const party = t.partyIds.map((id) => st.party.find((c) => c.id === id)).filter((c): c is Creature => !!c);
+    // After answering, wait for the host instead of offering the box again.
+    const mine = t.turn === this.me.id && this.talkSent !== `${t.id}:${t.ask}`;
+    this.talk.update(t, mine, party, this.snap!.vm.names, false);
   }
 
   private partyFor(p: PromptSpec): Creature[] {
@@ -366,6 +411,7 @@ export class GuestClient {
   private async menu(): Promise<void> {
     const r = await this.hud.sheet<string>({
       title: `Room ${this.link.code}`, options: [
+        { label: 'Quests', sub: this.snap ? questSummary(this.snap.state) : undefined, value: 'quests', icon: 'quest' },
         { label: 'Inventory', sub: this.snap ? invSummary(this.snap.state.inv) : undefined, value: 'inv', icon: 'potion' },
         { label: 'Journal', value: 'log', icon: 'sheet' },
         { label: 'My hero sheet', value: 'sheet', icon: 'sheet', disabled: this.myHeroes().length ? undefined : 'You are watching' },
@@ -373,6 +419,7 @@ export class GuestClient {
       ],
     });
     if (!r) return;
+    if (r.value === 'quests' && this.snap) this.hud.showQuests(questLog(this.snap.state));
     if (r.value === 'inv' && this.snap) this.hud.showInventory(this.snap.state.inv);
     if (r.value === 'log') this.hud.showLog();
     if (r.value === 'sheet') this.hud.showCharacter(this.myHeroes()[0]);

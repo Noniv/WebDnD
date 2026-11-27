@@ -2,6 +2,10 @@ const { C, r1, svg, write, rng, P, F, S, L, circ, ell, radial } = require('./com
 const FIG = require('./figures.cjs');
 
 const RING = { fighter: C.steel, rogue: C.verd, wizard: C.arc, cleric: C.gold, goblin: C.blood, goblin_boss: C.blood, skeleton: C.blood, ash_warden: C.blood };
+// village NPCs: a parchment ring reads as friendly/neutral; new monsters keep the red ring
+const FRIEND = C.p1;
+for (const n of ['innkeeper', 'priest', 'smith', 'elder', 'child', 'guard', 'stranger', 'miner', 'hermit']) RING[n] = FRIEND;
+for (const n of ['wolf', 'giant_rat', 'zombie', 'giant_spider']) RING[n] = C.blood;
 function arc(r, a0, a1) {
   const p = (a) => `${r1(64 + r * Math.cos((a * Math.PI) / 180))} ${r1(64 + r * Math.sin((a * Math.PI) / 180))}`;
   return `M${p(a0)} A${r} ${r} 0 0 1 ${p(a1)}`;

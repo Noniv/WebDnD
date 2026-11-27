@@ -57,7 +57,8 @@ export function computeVisible(w: World): Uint8Array {
   const viewers = w.state.party.filter((c) => !c.death.dead);
   const omenV = w.state.omen.omen.mods.vision ?? 0;
   for (const c of viewers) {
-    const r = visionRadius(c, omenV);
+    // Outdoors in daylight everyone sees the same distance; underground, torchlight and darkvision.
+    const r = w.def.daylight ?? visionRadius(c, omenV);
     for (let y = Math.max(0, c.pos.y - r); y <= Math.min(H - 1, c.pos.y + r); y++) {
       for (let x = Math.max(0, c.pos.x - r); x <= Math.min(W - 1, c.pos.x + r); x++) {
         const d = Math.hypot(x - c.pos.x, y - c.pos.y);

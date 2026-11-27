@@ -10,7 +10,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "sim": "vite build --ssr scripts/sim.ts --outDir node_modules/.sim --emptyOutDir --logLevel warn && node node_modules/.sim/sim.js"
+    "sim": "vite build --ssr scripts/sim.ts --outDir node_modules/.sim --emptyOutDir --logLevel warn && node node_modules/.sim/sim.js",
+    "dm-bench": "vite build --ssr scripts/dm-bench.ts --outDir node_modules/.dmbench --emptyOutDir --logLevel warn && node node_modules/.dmbench/dm-bench.js"
   },
   "engines": {
     "node": ">=20"

@@ -7,6 +7,7 @@ import {
   weaponDamageExpr, weaponToHit, type Creature,
 } from '../rules/creature';
 import { die, rollD20, rollExpr, combineAdv, type Adv } from '../rules/dice';
+import { MONSTERS } from '../rules/monsters';
 import { SPELLS, type SpellDef } from '../rules/spells';
 import type { Ability, ConditionId, CondInfo, DamageType, Pos, Weapon } from '../rules/types';
 import { canSee, clearShot, floodCosts, pathTo } from './grid';
@@ -310,6 +311,7 @@ export class Combat {
     if (a.conds.sapped) dis.push('Sapped');
     if (!melee && this.hostileAdjacent(a).length > 0) dis.push('Enemy adjacent');
     if (longRange) dis.push('Long range');
+    if (a.monsterId && MONSTERS[a.monsterId]?.pack && this.alliesOf(a).some((al) => al.id !== a.id && al.hp > 0 && canAct(al) && dist(al.pos, t.pos) <= 1)) adv.push('Pack Tactics');
     if (a.conds.blessed) extras.push({ label: 'Bless', value: die(4) });
     return { adv, dis, extras };
   }
@@ -362,6 +364,17 @@ export class Combat {
         else this.p.log(`${t.name} suffers a death save failure.`, 'bad');
       }
       return dmg;
+    }
+    // Undead Fortitude (drowned miners): a CON save against 5 + the damage keeps them standing at 1 HP.
+    if (t.monsterId === 'zombie' && t.hp - dmg <= 0 && type !== 'radiant' && !crit) {
+      const r = savingThrow(t, 'con', 5 + dmg);
+      await this.p.roll(r, 'Undead Fortitude');
+      if (r.success) {
+        t.hp = 1;
+        this.p.float(t.pos, 'refuses to fall', 0xcdb98f);
+        this.p.log(`${t.name} lurches back up, refusing to fall!`, 'bad');
+        return dmg;
+      }
     }
     t.hp = Math.max(0, t.hp - dmg);
     if (t.conds.asleep?.endsOnDamage) { delete t.conds.asleep; this.p.log(`${t.name} wakes up!`); }

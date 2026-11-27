@@ -3,13 +3,31 @@ import { Application, Container, Graphics, Sprite, Text, Texture } from 'pixi.js
 import { CONFIG } from '../config';
 import type { Creature } from '../rules/creature';
 import type { ConditionId, Pos } from '../rules/types';
-import type { MapObject } from '../game/dungeon';
+import type { MapObject, TileKind } from '../game/dungeon';
 import type { World } from '../game/state';
 import type { Marks } from '../net/protocol';
 import { PAL, glowTexture, tex } from './textures';
 import { animate, ease, isReducedMotion, tween, wait } from './tween';
 
 const T = CONFIG.TILE;
+
+/** The ground texture under a tile (trees and shrubs get their sprite on top of grass). */
+function groundKey(k: TileKind, n: number): string {
+  switch (k) {
+    case 'wall': return 'tiles/wall';
+    case 'crypt': return 'tiles/crypt_floor';
+    case 'rubble': return 'tiles/rubble';
+    case 'grass': case 'tree': case 'pine': case 'bush': return `tiles/grass_${n < 4 ? 1 : n < 6 ? 2 : 3}`;
+    case 'road': return `tiles/road_${n < 4 ? 1 : 2}`;
+    case 'dirt': return 'tiles/dirt';
+    case 'water': return 'tiles/water';
+    case 'housewall': return 'tiles/house_wall';
+    case 'roof': return 'tiles/roof';
+    case 'cave': return 'tiles/cave_floor';
+    case 'flooded': return 'tiles/flooded_floor';
+    default: return `tiles/floor_${n < 4 ? 1 : n < 6 ? 2 : 3}`;
+  }
+}
 
 interface TokenView {
   root: Container;
@@ -79,11 +97,23 @@ export class MapView {
         const k = def.tiles[y][x];
         const h = (x * 73856093) ^ (y * 19349663) ^ w.state.omen.seed;
         n = Math.abs(h) % 7;
-        const key = k === 'wall' ? 'tiles/wall' : k === 'crypt' ? 'tiles/crypt_floor' : k === 'rubble' ? 'tiles/rubble' : `tiles/floor_${n < 4 ? 1 : n < 6 ? 2 : 3}`;
         if (k === 'wall' && !this.nearFloor(x, y)) continue;
-        const s = new Sprite(tex(key));
+        const s = new Sprite(tex(groundKey(k, n)));
         s.position.set(x * T, y * T);
         s.setSize(T + 0.5, T + 0.5);
+        this.floor.addChild(s);
+      }
+    }
+    // Trees and shrubs stand on their grass, drawn after the ground so canopies can overhang a little.
+    for (let y = 0; y < def.h; y++) {
+      for (let x = 0; x < def.w; x++) {
+        const k = def.tiles[y][x];
+        if (k !== 'tree' && k !== 'pine' && k !== 'bush') continue;
+        const s = new Sprite(tex(`tiles/${k}`));
+        s.anchor.set(0.5);
+        s.position.set((x + 0.5) * T, (y + 0.5) * T);
+        const size = k === 'bush' ? T * 0.9 : T * 1.15;
+        s.setSize(size, size);
         this.floor.addChild(s);
       }
     }
@@ -133,6 +163,10 @@ export class MapView {
       case 'campfire': return 'tiles/campfire';
       case 'stairs': return 'tiles/stairs_up';
       case 'bones': return 'tiles/bones';
+      case 'exit': return `tiles/${o.prop ?? 'stairs_up'}`;
+      case 'inn': return 'tiles/door_house';
+      case 'cage': return o.open ? 'tiles/cage_open' : 'tiles/cage';
+      case 'decor': return o.prop ? `tiles/${o.prop}` : null;
     }
   }
 
@@ -227,7 +261,7 @@ export class MapView {
       if (key !== v.lastKey) {
         v.lastKey = key;
         v.hp.clear();
-        if (!isBrazier || c.hp > 0) {
+        if ((!isBrazier || c.hp > 0) && c.faction !== 'npc') {
           const wdt = T * 0.8, y = T * 0.42;
           const frac = Math.max(0, c.hp / c.maxHp);
           const col = c.faction === 'party' ? (frac > 0.5 ? PAL.verdigris : frac > 0.25 ? PAL.gold : PAL.blood) : PAL.blood;

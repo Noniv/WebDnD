@@ -8,22 +8,28 @@ A mobile-first, browser-based, **5e-compatible** dungeon crawl (SRD 5.2.1, CC-BY
 - Asked for SVG art to be made by a **separate subagent**. Keep doing that for new art sets.
 - Legal: call it "5e-compatible", never use "Dungeons & Dragons". Keep the SRD attribution in Credits and the README.
 - Don't commit or push unless asked.
+- Create and change files with the **Write/Edit tools**, not shell or Python scripts (Read the file first; Edit needs it).
+- Never put an OpenRouter key in the project (source, `.env`, docs, tests). Tests take it from the `OR_KEY` environment variable or put it in the test browser's localStorage.
 
 ## Commands
 ```bash
 npm run dev        # Vite on :5173 (I usually run --port 5199); also serves api/*.js via a middleware in vite.config.ts
 npm run typecheck  # tsc --noEmit (TS 7, strict, noUnusedLocals). Run it after every change
 npm run build      # typecheck + vite build -> dist/ (delete dist/ afterwards; it is gitignored anyway)
-npm run sim        # headless balance sim: runs the real Combat engine with bot party policies, 400 fights per row
-python tools/art/validate.py      # checks the 88 game SVGs (parse, sizes, no <text>/<image>, unique ids)
+npm run sim        # headless balance sim: runs the real Combat engine with bot party policies, 400 fights per row (den, boss, and the side fights)
+OR_KEY=... npm run dm-bench  # sends the real NPC prompts to the model and scores the replies (RUNS, TEMPS, SHOW_MISSES env vars)
+python tools/art/validate.py      # checks the 140 game SVGs (parse, sizes, no <text>/<image>, unique ids)
 node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
 ```
 
 ## Architecture (where things live)
 - `src/rules/`: pure 5e rules, no DOM. `dice.ts` (seeded RNG, adv/dis), `checks.ts` (d20 + mod vs DC/AC), `creature.ts` (Creature model, building, level-up, rests), `content.ts` (classes, species, backgrounds), `spells.ts`, `monsters.ts`, `types.ts`.
 - `src/game/`:
-  - `dungeon.ts`: the 21×38 map, built from rects in code; also objects, spawns, lights.
-  - `state.ts`: GameState, plain JSON and saveable.
+  - `dungeon.ts`: map types and the Emberdeep (`deep1`, 21×38), built from rects in code; also objects, spawns, lights.
+  - `areas.ts`: the other areas (`town` Emberford, `road`, `deep2` the Drowned Workings) and `buildArea(id)`. Exits are `kind: 'exit'` objects with `to: {area, at}`; scenery is `kind: 'decor'` with a `prop` texture. Rooms can carry an `encounter` group that starts a fight on entry.
+  - `state.ts`: GameState, plain JSON and saveable. `monsters`/`objects`/`seen` are the *current* area; areas you left are stored in `areas`. `enterArea()` switches. Also `quests`, `flags` (story switches) and `memory` (what each NPC remembers of past talks).
+  - `npcs.ts`: every person's sheet (persona, knows, secrets, allowed effects, scripted fallback topics), the world lore, `QUESTS` and `questLog()`.
+  - `dm.ts`: the AI dungeon master: OpenRouter call (`dmCall`), the system prompt, and `parseReply()`, which validates the model's JSON (skills mapped to the game's, DC clamped, effects filtered to the NPC's list).
   - `grid.ts`: LOS/fog (`computeVisible`), pathing (`floodCosts`/`pathTo`), `clearShot` (a more forgiving tabletop-style line of effect).
   - `combat.ts`: the turn loop, actions, AI. Rules only: it talks to the screen through the `Presenter` (`presenter.ts`, which also has a `headless` version).
   - `dialogue.ts`: the Snikk dialogue as data.
@@ -35,7 +41,7 @@ node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
   - `fx.ts`: shared effects, also used by co-op guests.
   - `textures.ts`: loads the SVGs; anything missing gets a drawn fallback.
   - `tween.ts`: every animation and pause goes through `animate()` and is scaled by the global game speed (`setTimeScale`).
-- `src/ui/`: `hud.ts` (party plates, dock, sheets, dialogue, panels, turn-order strip), `create.ts` (party builder, abilities card), `lobby.ts`, `title.ts`, `sfx.ts` (procedural Web Audio), `dom.ts` (`h()` helper).
+- `src/ui/`: `hud.ts` (party plates, dock, sheets, dialogue, panels, turn-order strip, quests, inventory), `talk.ts` (the free-text conversation panel, drawn from a `TalkVM`), `dmcard.ts` (the OpenRouter key card in Settings and the host lobby), `create.ts` (party builder, abilities card), `lobby.ts`, `title.ts`, `sfx.ts` (procedural Web Audio), `dom.ts` (`h()` helper).
 - `src/net/`: co-op. `p2p.ts` (`Wire`: trystero room keyed by the 4-letter code, per-peer numbered messages delivered in order), `protocol.ts` (types incl. `WireMsg`), `host.ts` (HostLink + HostHud), `guest.ts` (GuestLink + GuestClient), `identity.ts` (persistent player id/name).
 - `api/`: Vercel functions with the Node `(req, res)` signature, no dependencies. `daily.js` (omen) uses `shared/omen.js`; `health.js`.
 - `public/art/`: tiles, tokens, portraits, icons, `ui/gold/*` (the filigree kit, mostly CSS border-image 9-slices). Generators live in `tools/art/*.cjs` and `tools/ui-gold/gen.cjs`.
@@ -45,7 +51,15 @@ node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
 - **Every obstacle has ≥2 solutions** that suit different characters (talk / sneak / fight; disarm / time it / leap; key / pick / force; douse the brazier / Turn Undead / the phial). Keep that when adding content.
 - **Balance targets** (`npm run sim`): ignoring the boss's systems should win about 60%, and using them about 80–90%. No strategy may dominate. Rerun the sim after any rules or monster change.
 - **Pacing:** never hard-code instant UI; use `animate`/`wait`/`p.pause` so the Game speed setting applies. Toasts and banners compute their reading time from text length.
-- **Saves:** GameState must stay JSON-serialisable. Bump `CONFIG.SAVE_VERSION` if its shape changes incompatibly.
+- **Saves:** GameState must stay JSON-serialisable. Bump `CONFIG.SAVE_VERSION` if its shape changes incompatibly (it is 2 since the areas update).
+
+## Conversations and the AI dungeon master
+- Every talk goes through `director.converse(npc, opts)`. With a key it runs the AI loop (opening line, then player text → model → optional `check()` with the real dice → the success or failure branch → effects). Without a key it falls back to `scriptedTalk()` from the NPC's `topics`. Snikk's den uses `denTalk()` (AI) or the old `SNIKK` tree in `dialogue.ts`.
+- **The model never changes the game directly.** It returns effect ids; `talkEffect()` applies them once each and ignores anything not on that NPC's `effects` list. New rewards = a new `EffectId` + a line in the NPC's `effects` describing *when* to use it + handling in `talkEffect()`/`afterTalk()`.
+- The prompt says effects are "the only way the game learns what happened". Without that, the model narrated things (a quest, a key) it never triggered. When the story text and the effects disagree, fix the effect descriptions in `npcs.ts` and check with `npm run dm-bench`.
+- Settings measured with the bench: reasoning off (`reasoning: {enabled: false}`, about 1 s per reply) and temperature 0.5 (0.8 started dropping JSON fields).
+- Quest rewards are handed over at the start of a talk with the giver (`turnIn()`): `news` goes to the model so the NPC reacts, `notes` go to the players.
+- Conversations are a scene (`holdScene`), so every walker stops. In co-op the talk is mirrored through `ViewModel.talk` and answered with the `say` intent; only `TalkVM.turn` (the decider) gets the text box, the host can "Answer for them", and the panel hides while dice roll (`rolling`).
 
 ## Co-op model (read before touching the director or HUD)
 - The host's browser runs everything. `HostLink.emit()` sends events to guests right away (batched per microtask); `flush()` sends the snapshot `{state, vm}` when it changed, at most every 150 ms, always after pending events. Guests replay events (dice, moves, fx, toasts) and apply snapshots strictly in arrival order (`Wire` re-orders by sequence number, since trystero can let a small message overtake a big one).
@@ -75,6 +89,7 @@ node tools/ui-gold/validate.cjs   # checks the gold filigree UI kit
 - Buttons use `clip-path` chevrons plus border-image; the primary button is struck gold.
 
 ## Windows / tooling notes
-- Shell heredocs truncate large content: write big files with the Write tool, and do multi-replace edits with a small Python script saved to the scratchpad (`PYTHONUTF8=1`, `encoding='utf-8'`, `newline=''`, and `assert old in s` before each replace).
+- Shell heredocs truncate large content, which is one more reason to use the Write/Edit tools for every file change.
+- Tests that tap a menu right after opening it must wait over 350 ms (the ghost-click guard). Keep map taps within a few squares of the hero, or they land on the HUD (the party plates catch taps near the top).
 - Files have CRLF line endings; don't fight it.
 - PixiJS: load the `pixijs-skills:pixijs` skill before touching Pixi code. v8 API: `await app.init()`, shape then `fill()`, `eventMode`, and `Assets` with SVG `data.resolution`.

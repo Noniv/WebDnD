@@ -57,6 +57,8 @@ export interface Creature {
   };
   conds: Partial<Record<ConditionId, CondInfo>>;
   concentration?: { spell: string; targets: string[] };
+  /** Which fight a monster belongs to ('den', 'wolves'...), or 'npc'. */
+  group?: string;
   // Monster
   monsterId?: string;
   ai?: AiKind;
@@ -185,7 +187,7 @@ export function buildMonster(id: string, pos: Pos, hpBonus = 0): Creature {
     id: newId('m'),
     name: m.name,
     kind: 'monster',
-    faction: m.ai === 'object' ? 'object' : m.undead ? 'undead' : 'goblins',
+    faction: m.faction ?? (m.ai === 'object' ? 'object' : m.undead ? 'undead' : 'goblins'),
     token: m.token,
     portrait: m.portrait,
     level: 1,

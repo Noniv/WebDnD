@@ -3,11 +3,11 @@
 // receives intents, and routes prompts to whichever player controls the deciding hero.
 import type { Creature } from '../rules/creature';
 import type { GameState } from '../game/state';
-import { Hud, type DockBtn, type SheetSpec, type SheetOption } from '../ui/hud';
+import { Hud, type DockBtn, type SheetSpec, type SheetOption, type TalkAnswer } from '../ui/hud';
 import { h } from '../ui/dom';
 import { sfx } from '../ui/sfx';
 import { Wire } from './p2p';
-import type { DockSpec, IncomingIntent, Intent, NetEvent, OptSpec, PromptSpec, RoomInfo, RoomMeta, Snapshot, ViewModel, WireMsg } from './protocol';
+import type { DockSpec, IncomingIntent, Intent, NetEvent, OptSpec, PromptSpec, RoomInfo, RoomMeta, Snapshot, TalkVM, ViewModel, WireMsg } from './protocol';
 
 const MAX_GUESTS = 3;
 const SNAP_MS = 150;
@@ -23,7 +23,7 @@ export class HostLink {
   meta: RoomMeta;
   vm: ViewModel = {
     mode: 'explore', leader: 0, leads: {}, turnId: null, chips: [], turnbar: null, order: null, dock: { for: null, buttons: [] },
-    marks: {}, prompt: null, end: null, owners: {}, names: {},
+    marks: {}, prompt: null, talk: null, end: null, owners: {}, names: {},
   };
   private wire: Wire | null = null;
   /** Connected peer id -> player id. */
@@ -162,7 +162,7 @@ export class HostLink {
     this.vm.marks = this.getMarks();
     this.vm.owners = this.owners(state.party);
     this.vm.names = this.names;
-    const snap: Snapshot = { state: { ...state, log: [] }, vm: this.vm };
+    const snap: Snapshot = { state: { ...state, log: [], areas: {}, memory: {} }, vm: this.vm };
     return { snap, key: JSON.stringify(snap) };
   }
 
@@ -288,6 +288,47 @@ export class HostHud extends Hud {
     this.link.vm.end = { title: opts.title, text: opts.text, lines: opts.lines ?? [], emblem: !!opts.emblem };
     this.link.vm.mode = 'end';
     return super.endScreen(opts);
+  }
+
+  // ----- AI conversations -----
+
+  private talkRemote: ((a: TalkAnswer) => void) | null = null;
+
+  override setTalk(vm: TalkVM | null, party: Creature[] = this.talkParty): void {
+    this.link.vm.talk = vm;
+    if (!vm) this.talkRemote = null;
+    super.setTalk(vm, party);
+  }
+
+  protected override talkNames(): Record<string, string> { return this.link.names; }
+  protected override isHost(): boolean { return true; }
+
+  override talkAsk(vm: TalkVM, party: Creature[]): Promise<TalkAnswer> {
+    const to = this.remoteDecider();
+    vm.turn = to ?? this.link.me;
+    if (!to) return super.talkAsk(vm, party);
+    // A guest answers; the host sees it read-only, with "Answer for them".
+    return new Promise((resolve) => {
+      this.talkRemote = (a) => { this.talkRemote = null; this.talkWait = null; resolve(a); };
+      this.setTalk(vm, party);
+    });
+  }
+
+  protected override talkTakeOver(): void {
+    const vm = this.talkVm;
+    const done = this.talkRemote;
+    if (!vm || !done) return;
+    vm.turn = this.link.me;
+    vm.ask++;
+    this.talkWait = (a) => { this.talkWait = null; done(a); };
+    this.setTalk(vm);
+  }
+
+  /** A guest spoke in a conversation. */
+  sayFrom(i: Extract<Intent, { type: 'say' }>, from: string): void {
+    const vm = this.talkVm;
+    if (!vm || !this.talkRemote || vm.id !== i.talk || vm.ask !== i.ask || vm.turn !== from) return;
+    this.talkRemote({ text: typeof i.text === 'string' ? i.text.slice(0, 240) : null, actorId: i.actorId });
   }
 
   // ----- prompts -----

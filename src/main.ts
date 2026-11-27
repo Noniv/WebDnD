@@ -20,6 +20,7 @@ import { showCoopStart, LobbyView } from './ui/lobby';
 import { seedRng } from './rules/dice';
 import { defaultBuild, showCreate } from './ui/create';
 import { h, layer } from './ui/dom';
+import { dmCard } from './ui/dmcard';
 import { Hud } from './ui/hud';
 import { initAudio, setMuted, setVolume, sfx } from './ui/sfx';
 import { showTitle } from './ui/title';
@@ -242,8 +243,9 @@ function isBuild(b: unknown): b is CharacterBuild {
         refresh();
       }
     };
+    const dm = dmCard();
     lobby = new LobbyView({
-      code: l.code, me: me.id, isHost: true,
+      code: l.code, me: me.id, isHost: true, dmCard: dm,
       onSeat: seat, onCustomize: (i) => editParty(i), onEditParty: () => editParty(),
       onStart: () => {
         const party = builds.map(buildCharacter);
@@ -341,6 +343,7 @@ function isBuild(b: unknown): b is CharacterBuild {
       row('Reduced motion', settings.reducedMotion, (v) => (settings = { ...settings, reducedMotion: v })),
       row('Mute sound', settings.muted, (v) => (settings = { ...settings, muted: v })),
       h('div', { class: 'sec' }, 'Volume'), vol,
+      h('div', { class: 'sec' }, 'AI Dungeon Master'), dmCard(),
     );
     void popups.panel('Settings', body, true);
   }
@@ -350,9 +353,10 @@ function isBuild(b: unknown): b is CharacterBuild {
       h('p', { class: 'feat' }, 'Emberdeep is an independent, 5e-compatible game. Code, art and writing are original to this project.'),
       h('div', { class: 'sec' }, 'Rules attribution'),
       h('p', { class: 'feat', html: 'This work includes material from the System Reference Document 5.2.1 ("SRD 5.2.1") by Wizards of the Coast LLC, available at <a href="https://www.dndbeyond.com/srd" target="_blank" rel="noopener">https://www.dndbeyond.com/srd</a>. The SRD 5.2.1 is licensed under the Creative Commons Attribution 4.0 International License, available at <a href="https://creativecommons.org/licenses/by/4.0/legalcode" target="_blank" rel="noopener">https://creativecommons.org/licenses/by/4.0/legalcode</a>.' }),
-      h('p', { class: 'feat' }, 'Changes: rules are simplified for a short digital delve (levels 1–3, eight skills, a subset of spells, conditions and monsters). The Ash Warden, Snikk and the dungeon are original.'),
+      h('p', { class: 'feat' }, 'Changes: rules are simplified for a short digital adventure (levels 1–3, eight skills, a subset of spells, conditions and monsters). Emberford and its people, Snikk, the Ash Warden and the maps are original.'),
       h('div', { class: 'sec' }, 'Built with'),
-      h('p', { class: 'feat' }, 'PixiJS v8 · Vite · Cinzel & Alegreya Sans (SIL Open Font License).'),
+      h('p', { class: 'feat' }, 'PixiJS v8 · Vite · trystero (peer-to-peer co-op) · Cinzel & Alegreya Sans (SIL Open Font License).'),
+      h('p', { class: 'feat' }, 'The optional AI dungeon master uses a language model chosen by the host, through OpenRouter.'),
     );
     void popups.panel('Credits & license', body, true);
   }

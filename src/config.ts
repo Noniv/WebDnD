@@ -28,7 +28,7 @@ export const CONFIG = {
   ZOOM_MIN: 0.55,
   ZOOM_MAX: 2.2,
   /** Save format version; bump when the shape changes. */
-  SAVE_VERSION: 1,
+  SAVE_VERSION: 2,
   SAVE_KEY: 'emberdeep.save.v1',
   SETTINGS_KEY: 'emberdeep.settings.v1',
 };

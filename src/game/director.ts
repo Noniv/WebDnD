@@ -18,16 +18,22 @@ import { wait } from '../render/tween';
 import type { MapView } from '../render/view';
 import { Hud, type DockBtn, type SheetOption } from '../ui/hud';
 import { HostHud, type HostLink } from '../net/host';
-import type { IncomingIntent, NetEvent } from '../net/protocol';
+import type { IncomingIntent, NetEvent, TalkVM } from '../net/protocol';
 import { playFx, showDamage, showHeal } from '../render/fx';
 import { sfx } from '../ui/sfx';
 import { Combat } from './combat';
 import { SNIKK, type DCtx, type DialogueEnd, type DOption } from './dialogue';
 import { inRect, type MapObject } from './dungeon';
+import { AREA_NAMES } from './areas';
+import { dmCall, dmReady, parseReply, systemPrompt, type ChatMsg, type DmReply, type TalkContext } from './dm';
+import { NPCS, QUESTS, npcForMonster, questLog, questSummary, type EffectId, type NpcDef } from './npcs';
 import { computeVisible, pathAdjacent, pathTo, canSee } from './grid';
 import type { Presenter } from './presenter';
 import { saveGame } from './save';
-import { addLog, armedTrapAt, creatureAt, dist, invSummary, livingParty, objectsAt, roomAt, type World } from './state';
+import { addLog, armedTrapAt, creatureAt, dist, enterArea, invSummary, livingParty, objectsAt, roomAt, type QuestId, type World } from './state';
+
+/** Effects that settle a conversation with Snikk (and end it). */
+const ENDING: ReadonlySet<EffectId> = new Set<EffectId>(['ally', 'peace', 'toll', 'flee', 'fight']);
 
 type TargetMode =
   | { kind: 'aim'; aim: Aim }
@@ -108,6 +114,7 @@ export class Director {
       case 'tap': void this.onTap({ x: i.x, y: i.y }, i.from); break;
       case 'dock': hh.dockTap(i.id, i.from); break;
       case 'answer': hh.answer(i.pid, i.index, i.actorId, i.from); break;
+      case 'say': hh.sayFrom(i, i.from); break;
       case 'leader':
         if (!this.s.party[i.idx]) break;
         if (this.mode !== 'combat' && this.blocked) this.tellBusy(i.from);
@@ -176,8 +183,8 @@ export class Director {
     const room = roomAt(this.w, this.leader.pos);
     if (!isLoad) {
       this.hud.showBanner(room?.name ?? 'Emberdeep', room?.intro ?? '', 6000);
-      this.hud.log('Tap the floor to walk. Tap doors, chests and creatures to interact. Tap a hero to lead; tap again for their sheet.');
-      this.s.visited.push('stair');
+      this.hud.log('Tap the ground to walk. Tap people to talk, and doors, chests and creatures to interact. Tap a hero to lead; tap again for their sheet.');
+      if (room) this.s.visited.push(room.id);
     } else {
       this.hud.showBanner(room?.name ?? 'Emberdeep', 'You pick up where you left off.');
       for (const l of this.s.log.slice(-1)) this.hud.log(l);
@@ -310,7 +317,17 @@ export class Director {
       this.hud.decider = from;
       this.useLead(from);
       this.busy = true;
-      try { await this.tapMonster(mon); } finally { this.busy = false; this.exploreDock(); }
+      try {
+        if (mon.faction === 'npc') {
+          // Walk over to talk (people in cages are reached through the bars).
+          if (dist(this.leader.pos, mon.pos) > 1) {
+            const adj = pathAdjacent(this.w, this.leader.pos, mon.pos, { avoidTraps: true, blockers: this.blockers() });
+            if (adj === null) { this.tellPlayer(from, `You cannot reach ${mon.name} from here.`); return; }
+            if (adj.length && !(await this.walk(adj, from))) return;
+          }
+          await this.talkTo(mon);
+        } else await this.tapMonster(mon);
+      } finally { this.busy = false; this.exploreDock(); }
       return;
     }
     // object?
@@ -482,6 +499,14 @@ export class Director {
       await this.holdScene(() => this.startBoss());
       return true;
     }
+    const enc = room.encounter;
+    if (enc && this.s.monsters.some((m) => m.group === enc && m.hp > 0)) {
+      // Forewarned heroes catch the wolves napping; otherwise the pack springs the ambush.
+      const surprise = enc === 'wolves' ? (this.s.flags.wolvesWarned ? 'enemies' : 'party') : null;
+      this.hud.log(enc === 'wolves' ? (surprise === 'enemies' ? 'You spot the wolves first, just as Rusk and Moss said.' : 'The wolves burst from the undergrowth!') : room.intro, 'bad');
+      await this.holdScene(() => this.startCombat(enc, surprise));
+      return true;
+    }
     return false;
   }
 
@@ -535,6 +560,7 @@ export class Director {
   }
 
   private async dialogueScene(noticed: boolean): Promise<void> {
+    if (dmReady()) { await this.denTalk(noticed); return; }
     this.s.denNoticed = noticed;
     const ctx: DCtx = { potions: this.s.inv.potions, fearKnown: false, insightTried: false, noticed, dcMod: this.s.omen.omen.mods.goblinDC ?? 0 };
     let node = SNIKK.start;
@@ -640,8 +666,8 @@ export class Director {
   // ---------- Checks with rerolls ----------
 
   /** An ability check with the dice overlay, offering Heroic Inspiration or Tactical Mind on failure. */
-  async check(c: Creature, kind: CheckKind, dc: number, adv: string[] = []): Promise<TestResult> {
-    let r = abilityCheck(c, kind, dc, { adv });
+  async check(c: Creature, kind: CheckKind, dc: number, adv: string[] = [], dis: string[] = []): Promise<TestResult> {
+    let r = abilityCheck(c, kind, dc, { adv, dis });
     await this.p.roll(r);
     if (r.success) return r;
     // The hero's own player decides how to spend that hero's resources.
@@ -743,6 +769,10 @@ export class Director {
       case 'shrine': return this.restSheet(true);
       case 'campfire': this.hud.log('The goblins\' fire pops and spits.'); return;
       case 'stairs': this.hud.log('Daylight waits up there. The Warden waits down here.'); return;
+      case 'exit': return this.travel(o);
+      case 'inn': return this.innDoor();
+      case 'cage': return this.cageSheet(o);
+      case 'decor': this.hud.log(o.text ?? o.name); this.hud.toast(o.text ?? o.name); return;
     }
   }
 
@@ -763,6 +793,7 @@ export class Director {
     for (const l of o.loot ?? []) {
       if (l === 'potion') { this.s.inv.potions++; got.push('a Potion of Healing'); }
       else if (l === 'phial') { this.s.inv.phial++; got.push('the Ember Phial (holy light; shatters the Binding Brazier)'); }
+      else if (l === 'ore') { this.s.inv.items.push('ore'); got.push('a lump of glowing ember-ore (Old Torvin wants this)'); }
       else if (l.startsWith('gold:')) { const g = parseInt(l.slice(5), 10); this.s.inv.gold += g; got.push(`${g} gold`); }
     }
     this.hud.log(`Found ${got.join(', ') || 'nothing'}.`, 'good');
@@ -897,6 +928,468 @@ export class Director {
     await this.roomCheck(this.leader);
   }
 
+  // ---------- Travel between areas ----------
+
+  private async travel(o: MapObject): Promise<void> {
+    const to = o.to!;
+    if (this.mode !== 'explore') return;
+    const r = await this.hud.sheet<boolean>({
+      title: o.name, lead: o.text,
+      options: [{ label: `Go to ${AREA_NAMES[to.area]}`, value: true, icon: 'move', primary: true, sub: this.link ? 'The whole party travels together.' : undefined }],
+    });
+    if (!r) return;
+    await this.holdScene(async () => {
+      for (const pid of [...this.walks.keys()]) await this.stopWalk(pid);
+      this.w = enterArea(this.w, to.area, to.at);
+      this.roomOf.clear();
+      for (const c of this.s.party) { const rm = roomAt(this.w, c.pos); if (rm) this.roomOf.set(c.id, rm.id); }
+      this.applyKnowledge();
+      this.view.build(this.w);
+      this.refresh();
+      this.exploreDock();
+      const room = roomAt(this.w, this.leader.pos);
+      const first = !!room && !this.s.visited.includes(room.id);
+      if (room && first) this.s.visited.push(room.id);
+      this.hud.showBanner(AREA_NAMES[to.area], first ? room!.intro : room?.name ?? '', first ? 6000 : 2500);
+      this.save();
+    });
+  }
+
+  /** What the party has learned shows up on the map (hidden doors, the trap). */
+  private applyKnowledge(): void {
+    if (this.s.area !== 'deep1') return;
+    const reveal = (id: string) => {
+      const o = this.s.objects.find((x) => x.id === id);
+      if (o && o.hidden) { o.hidden = false; this.onReveal(o); }
+    };
+    if (this.s.flags.secretsKnown) { reveal('secret-1'); reveal('secret-2'); }
+    if (this.s.flags.trapKnown) reveal('trap');
+  }
+
+  // ---------- The village: inn, shop ----------
+
+  private async innDoor(): Promise<void> {
+    const marta = this.s.monsters.find((m) => m.monsterId === 'npc-innkeeper');
+    const r = await this.hud.sheet<string>({
+      title: 'The Last Ember', lead: `A warm room, a hot meal and a full night's sleep: 5 gold. You have ${this.s.inv.gold} gold.`,
+      options: [
+        { label: 'Take a room (5 gold)', sub: 'A long rest: full HP and spell slots. You level up here if you have earned it.', value: 'rest', icon: 'rest_long', primary: true, disabled: this.s.inv.gold < 5 ? `Not enough gold: you have ${this.s.inv.gold}` : undefined },
+        ...(marta ? [{ label: 'Talk to Marta', value: 'talk', icon: 'talk' }] : []),
+      ],
+    });
+    if (!r) return;
+    if (r.value === 'rest') await this.innRest(false);
+    else if (marta) await this.talkTo(marta);
+  }
+
+  private async innRest(free: boolean): Promise<void> {
+    if (!free) {
+      if (this.s.inv.gold < 5) { this.tellPlayer(this.hud.decider ?? this.me, `A room costs 5 gold, and you have ${this.s.inv.gold}.`); return; }
+      this.s.inv.gold -= 5;
+      sfx.coin();
+    }
+    await this.longRestAll('at the Last Ember inn');
+  }
+
+  private potionPrice(): number { return this.s.flags.discount ? 35 : 50; }
+
+  private async openShop(): Promise<void> {
+    for (;;) {
+      const price = this.potionPrice();
+      const gold = this.s.inv.gold;
+      const r = await this.hud.sheet<string>({
+        title: 'Torvin\'s wares', lead: `You have ${gold} gold and ${this.s.inv.potions} potion${this.s.inv.potions === 1 ? '' : 's'}.`,
+        options: [{ label: 'Potion of Healing', sub: `${price} gold · restores 2d4 + 2 HP, even to a fallen hero`, value: 'potion', icon: 'potion', primary: true, disabled: gold < price ? `Not enough gold: you have ${gold}` : undefined }],
+      });
+      if (!r) return;
+      this.s.inv.gold -= price;
+      this.s.inv.potions++;
+      sfx.coin();
+      this.hud.log(`Bought a Potion of Healing for ${price} gold.`, 'good');
+      this.refreshHud();
+      this.save();
+    }
+  }
+
+  // ---------- The caged miner ----------
+
+  private async cageSheet(o: MapObject): Promise<void> {
+    if (o.open) { this.hud.log('The cage stands empty.'); return; }
+    const dagan = this.s.monsters.find((m) => m.monsterId === 'npc-miner');
+    const watched = this.denGoblins().length > 0 && this.s.den !== 'hostile';
+    const sneaky = this.s.den === 'sneaked';
+    const party = this.s.party.filter((c) => !c.death.dead);
+    const r = await this.hud.sheet<string>({
+      title: 'Prisoner cage', lead: `${o.text}${watched && !sneaky ? ' The goblins are watching.' : ''}`, party,
+      options: [
+        ...(dagan ? [{ label: 'Talk to the prisoner', value: 'talk', icon: 'talk' }] : []),
+        { label: 'Pick the lock', value: 'pick', icon: 'lockpick', check: { kind: 'tools' as CheckKind, dc: o.lockDC! }, sub: watched && !sneaky ? 'The goblins will see. That means a fight.' : watched ? 'Quietly, while they are busy. Failure gets you noticed.' : '' },
+        { label: 'Wrench the door open', value: 'force', icon: 'str', check: { kind: 'athletics' as CheckKind, dc: o.forceDC! }, sub: watched ? 'Loud: the goblins will come.' : 'Loud, but nobody is left to hear.' },
+      ],
+    });
+    if (!r) return;
+    if (r.value === 'talk' && dagan) { await this.talkTo(dagan); return; }
+    if (watched && (!sneaky || r.value === 'force')) {
+      const yes = await this.hud.choose('The goblins are watching', 'Breaking their prisoner out in front of them means a fight.', [
+        { label: 'Do it anyway', value: true, detail: 'Steel yourselves.' }, { label: 'Leave it', value: false, primary: true }]);
+      if (!yes) return;
+      this.s.den = 'hostile';
+      this.refresh();
+      await this.startCombat('den', null);
+      return;
+    }
+    const res = await this.check(r.actor!, r.value === 'pick' ? 'tools' : 'athletics', r.value === 'pick' ? o.lockDC! : o.forceDC!);
+    if (res.success) { await this.freeMiner(true); return; }
+    if (watched) {
+      this.hud.log('The cage door squeals. Snikk spins around.', 'bad');
+      this.s.den = 'unaware';
+      await this.runDialogue(true);
+      return;
+    }
+    this.hud.log('The cage holds. Try again.');
+  }
+
+  /** Open the cage: Dagan is free and heads home (he waits in the village). */
+  private async freeMiner(talk: boolean): Promise<void> {
+    if (this.s.flags.minerFreed) return;
+    const cage = this.s.objects.find((x) => x.kind === 'cage');
+    if (cage) { cage.open = true; cage.locked = false; }
+    this.s.flags.minerFreed = true;
+    sfx.coin();
+    this.refresh();
+    const dagan = this.s.monsters.find((m) => m.monsterId === 'npc-miner');
+    if (talk && dagan) await this.converse(NPCS.miner, { situation: ['The party has just opened Dagan\'s cage. He is free, stiff and grateful, and wants to hurry home to his daughter Pell.'] });
+    if (dagan) {
+      this.s.monsters.splice(this.s.monsters.indexOf(dagan), 1);
+      this.view.syncTokens();
+    }
+    this.hud.log('Dagan limps for the stairs, home to Pell in Emberford.', 'good');
+    this.award('freed', 50, 'Freed Dagan the miner');
+    this.refresh();
+    this.save();
+  }
+
+  // ---------- Conversations ----------
+
+  private async talkTo(m: Creature): Promise<void> {
+    const npc = npcForMonster(m.monsterId);
+    if (!npc) { this.inspect(m); return; }
+    const caged = npc.id === 'miner' && this.s.area === 'deep1' && !this.s.flags.minerFreed;
+    const got = await this.holdScene2(() => this.converse(npc, {
+      situation: caged ? ['Dagan is locked in an iron cage in the goblin den. He talks to the party through the bars, whispering so the goblins do not hear.'] : [],
+    }));
+    await this.afterTalk(got);
+    if (npc.id === 'elder' && this.s.flags.endgame) this.finale();
+  }
+
+  /** Like holdScene, for scenes that return something. */
+  private async holdScene2<T>(fn: () => Promise<T>): Promise<T> {
+    this.scene++;
+    try { return await fn(); } finally { this.scene--; }
+  }
+
+  /** Effects that open something after the conversation closes. */
+  private async afterTalk(got: EffectId[]): Promise<void> {
+    if (got.includes('release_miner')) await this.freeMiner(false);
+    if (got.includes('rest_free')) await this.innRest(true);
+    else if (got.includes('rest')) await this.innRest(false);
+    if (got.includes('shop')) await this.openShop();
+    this.refresh();
+    this.save();
+  }
+
+  /** Whether a quest's job is done (it can then be handed in to its giver). */
+  private objectiveDone(q: QuestId): boolean {
+    const s = this.s;
+    switch (q) {
+      case 'warden': return s.bossDone;
+      case 'miner': return !!s.flags.minerFreed;
+      case 'wolves': return !!s.flags['cleared:wolves'];
+      case 'drowned': return !!s.flags['cleared:drowned'];
+      case 'lode': return s.inv.items.includes('ore');
+    }
+  }
+
+  /**
+   * Hand in finished quests to this person. Returns `news` (what happened, told to the AI so the
+   * person reacts) and `notes` (the same, in the player's words, for the conversation panel).
+   */
+  private turnIn(npc: NpcDef): { news: string[]; notes: string[] } {
+    const news: string[] = [];
+    const notes: string[] = [];
+    const got: Record<QuestId, string> = {
+      warden: '100 gold', miner: '50 gold', wolves: 'two Potions of Healing',
+      drowned: '40 gold and the Candle\'s blessing for your next fight', lode: '60 gold and a Potion of Healing',
+    };
+    const ids = (Object.keys(QUESTS) as QuestId[]).filter((q) => QUESTS[q].giver === npc.id || (q === 'miner' && npc.id === 'miner'));
+    for (const q of ids) {
+      if (this.s.quests[q] === 'done' || !this.objectiveDone(q)) continue;
+      this.s.quests[q] = 'done';
+      const inv = this.s.inv;
+      switch (q) {
+        case 'warden':
+          inv.gold += 100;
+          this.s.flags.endgame = true;
+          news.push('The party has destroyed the Ash Warden and come back to tell her. She pays the promised 100 gold.');
+          break;
+        case 'miner':
+          inv.gold += 50;
+          this.award('q-miner', 100, 'Brought Dagan home to Pell');
+          news.push('Dagan is home with Pell, thanks to the party. Dagan has pressed his savings, 50 gold, into their hands.');
+          break;
+        case 'wolves':
+          inv.potions += 2;
+          this.award('q-wolves', 50, 'Cleared the wolves from the mine road');
+          news.push('The party has dealt with the wolves. Old Moss has given them two healing draughts (Potions of Healing).');
+          break;
+        case 'drowned':
+          inv.gold += 40;
+          this.s.flags.blessing = true;
+          this.award('q-drowned', 75, 'Laid the drowned miners to rest');
+          news.push('The party has laid the drowned miners to rest. Aldric has given them 40 gold from the chapel box and the Candle\'s blessing for their next fight.');
+          break;
+        case 'lode':
+          inv.items.splice(inv.items.indexOf('ore'), 1);
+          inv.gold += 60;
+          inv.potions += 1;
+          this.award('q-lode', 50, 'Brought the ember-ore to Torvin');
+          news.push('The party has brought Torvin the ember-ore from the Lost Lode. He has paid them 60 gold and a Potion of Healing.');
+          break;
+      }
+      this.hud.toast(`Quest complete: ${QUESTS[q].name}`);
+      notes.push(`Quest complete: ${QUESTS[q].name}. You receive ${got[q]}.`);
+    }
+    if (news.length) { sfx.coin(); this.refreshHud(); }
+    return { news, notes };
+  }
+
+  private talkContext(npc: NpcDef, situation: string[], news: string[]): TalkContext {
+    const room = roomAt(this.w, this.leader.pos);
+    const checks: CheckKind[] = ['persuasion', 'intimidation', 'insight', 'perception', 'investigation', 'arcana', 'athletics', 'stealth'];
+    const names: Partial<Record<CheckKind, string>> = { persuasion: 'Persuasion', intimidation: 'Intimidation', insight: 'Insight', perception: 'Perception', investigation: 'Investigation', arcana: 'Arcana', athletics: 'Athletics', stealth: 'Stealth' };
+    return {
+      party: this.s.party.filter((c) => !c.death.dead).map((c) => ({
+        name: c.name,
+        who: `level ${c.level} ${c.species ?? ''} ${c.classId ? CLASSES[c.classId].name : ''}`.replace(/\s+/g, ' ').trim(),
+        hp: `${Math.max(0, c.hp)}/${c.maxHp}`,
+        bonuses: checks.map((k) => ({ k, b: checkBonus(c, k) })).sort((a, b) => b.b - a.b).slice(0, 4).map((x) => `${names[x.k]} ${fmtMod(x.b)}`).join(', '),
+      })),
+      situation: [`Place: ${AREA_NAMES[this.s.area]}${room ? `, ${room.name}` : ''}.`, ...situation],
+      quests: questLog(this.s).map((q) => `${q.name} (${q.status})`),
+      inventory: invSummary(this.s.inv),
+      memory: this.s.memory[npc.id] ?? [],
+      justHappened: news,
+    };
+  }
+
+  /** Apply one effect from a conversation. Returns a line to show, or null. Deferred ones go into `got`. */
+  private talkEffect(npc: NpcDef, e: EffectId, got: EffectId[]): string | null {
+    const f = this.s.flags;
+    const short = npc.name.split(',')[0];
+    switch (e) {
+      case 'quest': {
+        const q = npc.quest;
+        if (!q || this.s.quests[q]) return null;
+        this.s.quests[q] = 'active';
+        this.hud.toast(`New quest: ${QUESTS[q].name}`);
+        return `New quest: ${QUESTS[q].name}. ${QUESTS[q].goal}`;
+      }
+      case 'gift_potion':
+        if (f[`gift:${npc.id}`]) return null;
+        f[`gift:${npc.id}`] = true;
+        this.s.inv.potions++;
+        return `${short} gives you a Potion of Healing.`;
+      case 'discount':
+        if (f.discount) return null;
+        f.discount = true;
+        return 'Torvin will now sell potions for 35 gold.';
+      case 'bless':
+        if (f.blessing) return null;
+        f.blessing = true;
+        return 'Blessed: everyone adds 1d4 to their attack rolls in the next fight.';
+      case 'reveal_secrets':
+        if (f.secretsKnown) return null;
+        f.secretsKnown = true;
+        this.applyKnowledge();
+        return 'You learn where the two hidden doors in the Emberdeep are. They will show on your map.';
+      case 'reveal_trap':
+        if (f.trapKnown) return null;
+        f.trapKnown = true;
+        this.applyKnowledge();
+        return 'You learn about the needle trap in the Hall of Needles. It will show on your map.';
+      case 'warn_wolves':
+        if (f.wolvesWarned) return null;
+        f.wolvesWarned = true;
+        return 'You know where the wolves wait: they will not catch you off guard.';
+      case 'take_potion':
+        if (this.s.inv.potions <= 0 || f.paidPotion) return null;
+        this.s.inv.potions--;
+        f.paidPotion = true;
+        return 'You hand over a Potion of Healing.';
+      default:
+        if (!got.includes(e)) got.push(e);
+        return null;
+    }
+  }
+
+  /** Remember the gist of a conversation, so the person recalls it next time. */
+  private remember(npc: NpcDef, vm: TalkVM): void {
+    const lines = vm.lines.filter((l) => l.who !== 'note').map((l) => (l.who === 'npc' ? `${npc.name.split(',')[0]} said: ${l.text}` : l.who === 'hero' ? `${l.name} said: ${l.text}` : l.text).slice(0, 180));
+    this.s.memory[npc.id] = [...(this.s.memory[npc.id] ?? []), ...lines].slice(-14);
+  }
+
+  /**
+   * A conversation. With an OpenRouter key the AI dungeon master voices the person and
+   * the players type freely; without one, a short scripted talk. Returns deferred effects.
+   */
+  private async converse(npc: NpcDef, opts: { situation?: string[]; leaveLabel?: string; leaveEffect?: EffectId; decisive?: EffectId[] } = {}): Promise<EffectId[]> {
+    const { news, notes } = this.turnIn(npc);
+    if (!dmReady()) return this.scriptedTalk(npc, notes);
+    const got: EffectId[] = [];
+    const pid = this.hud.decider ?? this.me;
+    const living = this.s.party.filter((c) => !c.death.dead && c.hp > 0);
+    const own = this.link ? living.filter((c) => this.ownerOf(c) === pid) : living;
+    const speakers = own.length ? own : living;
+    const vm: TalkVM = {
+      id: crypto.randomUUID(), npc: { name: npc.name, title: npc.title, portrait: npc.portrait }, lines: [], turn: null, ask: 0,
+      thinking: true, rolling: false, suggestions: [], partyIds: speakers.map((c) => c.id), actorId: speakers[0]?.id ?? null, done: false,
+      leaveLabel: opts.leaveLabel ?? 'Leave',
+    };
+    for (const n of notes) vm.lines.push({ who: 'note', text: n });
+    this.hud.setTalk(vm, speakers);
+    const history: ChatMsg[] = [];
+    let failed = false;
+    const ask = async (user: string): Promise<DmReply | null> => {
+      vm.thinking = true;
+      this.hud.setTalk(vm, speakers);
+      try {
+        const sys = systemPrompt(npc, this.talkContext(npc, opts.situation ?? [], news));
+        for (let attempt = 0; attempt < 2; attempt++) {
+          const r = parseReply(await dmCall([{ role: 'system', content: sys }, ...history, { role: 'user', content: user }]), npc);
+          if (r) { failed = false; return r; }
+        }
+        vm.lines.push({ who: 'note', text: 'The words get lost. Try saying it another way.' });
+        return null;
+      } catch (e) {
+        if (!failed) vm.lines.push({ who: 'note', text: `${(e as Error).message} Try again, or leave.` });
+        failed = true;
+        return null;
+      } finally {
+        vm.thinking = false;
+      }
+    };
+
+    const open = await ask('[The party approaches. Speak first: greet them or react to the situation. No check.]');
+    const opening = open?.say || npc.greeting;
+    vm.lines.push({ who: 'npc', text: opening });
+    history.push({ role: 'user', content: '[The party approaches.]' }, { role: 'assistant', content: JSON.stringify({ say: opening }) });
+    vm.suggestions = open?.suggestions ?? [];
+    for (const e of open?.effects ?? []) { const note = this.talkEffect(npc, e, got); if (note) vm.lines.push({ who: 'note', text: note }); }
+
+    let turns = 0;
+    let ended = got.some((e) => ENDING.has(e));
+    while (!ended) {
+      vm.ask++;
+      const a = await this.hud.talkAsk(vm, speakers);
+      if (a.text === null) { if (opts.leaveEffect && !got.includes(opts.leaveEffect)) got.push(opts.leaveEffect); break; }
+      const hero = speakers.find((c) => c.id === a.actorId) ?? speakers[0];
+      vm.actorId = hero.id;
+      vm.lines.push({ who: 'hero', name: hero.name, text: a.text });
+      vm.suggestions = [];
+      turns++;
+      const nudge = turns >= 8
+        ? opts.decisive ? ` [The talk has gone on long enough: settle it now with one of these effects: ${opts.decisive.join(', ')}.]` : ' [Start wrapping the conversation up.]'
+        : '';
+      const user = `${hero.name}: ${a.text}${nudge}`;
+      const r = await ask(user);
+      if (!r) continue;
+      let say = r.say;
+      let effects = r.effects;
+      let end = r.end;
+      let result = '';
+      if (r.check && r.success && r.failure) {
+        if (r.say) vm.lines.push({ who: 'npc', text: r.say });
+        vm.rolling = true;
+        this.hud.setTalk(vm, speakers);
+        const adv = r.check.adv === 'advantage' ? [r.check.why || 'A clever approach'] : [];
+        const dis = r.check.adv === 'disadvantage' ? [r.check.why || 'A poor approach'] : [];
+        const res = await this.check(hero, r.check.kind, r.check.dc, adv, dis);
+        vm.rolling = false;
+        const label = r.check.label.replace(/^\w/, (ch) => ch.toUpperCase());
+        vm.lines.push({ who: 'roll', ok: res.success, text: `${hero.name} · ${label} ${res.total} vs DC ${r.check.dc}: ${res.success ? 'success' : 'failure'}` });
+        result = `${label} check DC ${r.check.dc}: ${hero.name} rolled ${res.total}, ${res.success ? 'success' : 'failure'}`;
+        const br = res.success ? r.success : r.failure;
+        say = br.say;
+        effects = br.effects;
+        end = br.end;
+      }
+      vm.lines.push({ who: 'npc', text: say });
+      history.push({ role: 'user', content: user }, { role: 'assistant', content: JSON.stringify(result ? { check_result: result, say: `${r.say ? `${r.say} ` : ''}${say}`, effects } : { say, effects }) });
+      for (const e of effects) { const note = this.talkEffect(npc, e, got); if (note) vm.lines.push({ who: 'note', text: note }); }
+      vm.suggestions = r.suggestions;
+      this.refreshHud();
+      if (end || effects.some((e) => ENDING.has(e)) || turns >= 12) ended = true;
+    }
+    if (ended) {
+      vm.done = true;
+      vm.suggestions = [];
+      vm.ask++;
+      await this.hud.talkAsk(vm, speakers);
+    }
+    this.hud.setTalk(null);
+    this.remember(npc, vm);
+    this.save();
+    return got;
+  }
+
+  /** Without an API key: a short conversation from the NPC's scripted topics. */
+  private async scriptedTalk(npc: NpcDef, news: string[]): Promise<EffectId[]> {
+    const got: EffectId[] = [];
+    const party = this.s.party.filter((c) => !c.death.dead);
+    let text = [...news, npc.greeting].join(' ');
+    const used = new Set<number>();
+    for (let turn = 0; turn < 8; turn++) {
+      const opts: SheetOption<number>[] = npc.topics.map((t, i) => ({
+        label: t.label, value: i, icon: t.check ? 'd20' : 'talk', tag: used.has(i) ? 'asked' : undefined,
+        check: t.check ? { kind: t.check.kind, dc: t.check.dc } : undefined,
+      }));
+      opts.push({ label: 'Goodbye.', value: -1, icon: 'close' });
+      const r = await this.hud.dialogue({ name: npc.name, portrait: npc.portrait, narrator: false }, text, opts, party);
+      if (!r || r.value === -1) break;
+      const t = npc.topics[r.value];
+      used.add(r.value);
+      if (t.check && r.actor) {
+        const res = await this.check(r.actor, t.check.kind, t.check.dc);
+        if (!res.success) { text = t.check.fail; continue; }
+      }
+      const notes = (t.effects ?? []).map((e) => this.talkEffect(npc, e, got)).filter((n): n is string => !!n);
+      text = notes.length ? `${t.reply} (${notes.join(' ')})` : t.reply;
+      if ((t.effects ?? []).some((e) => e === 'shop' || e === 'rest' || e === 'rest_free')) {
+        await this.hud.dialogue({ name: npc.name, portrait: npc.portrait, narrator: false }, text, [{ label: 'Continue', value: -1, icon: 'talk', primary: true }], party);
+        break;
+      }
+    }
+    return got;
+  }
+
+  /** Snikk's den, voiced by the AI dungeon master. */
+  private async denTalk(noticed: boolean): Promise<void> {
+    this.s.denNoticed = noticed;
+    const caged = !this.s.flags.minerFreed;
+    const got = await this.converse(NPCS.snikk, {
+      situation: [
+        noticed ? 'The goblins caught the party sneaking in. Snikk is angry and suspicious: persuading him is harder.' : 'The party walked openly into the den.',
+        `Snikk has ${this.denGoblins().length - 1} goblins with him around the fire, weapons out.`,
+        caged ? 'Dagan, a captured miner, is locked in a cage in the corner of the den.' : 'The prisoner cage in the corner is empty.',
+        'The talk must end with one of: ally, peace, toll, flee or fight.',
+      ],
+      leaveLabel: 'Fight!', leaveEffect: 'fight', decisive: ['ally', 'peace', 'toll', 'flee', 'fight'],
+    });
+    const outcome = (['fight', 'flee', 'ally', 'toll', 'peace'] as const).find((o) => got.includes(o)) ?? 'peace';
+    if (outcome !== 'fight' && got.includes('release_miner')) await this.freeMiner(false);
+    await this.applyDenOutcome(outcome);
+  }
+
   // ---------- Rests ----------
 
   private async restSheet(atShrine: boolean): Promise<void> {
@@ -946,11 +1439,11 @@ export class Director {
     this.save();
   }
 
-  private async longRestAll(): Promise<void> {
+  private async longRestAll(where = 'beneath the Last Candle'): Promise<void> {
     for (const c of this.s.party) if (!c.death.dead) longRest(c);
     this.s.shortRests = 0;
     sfx.heal();
-    this.hud.log('You sleep beneath the Last Candle. Hit points and spell slots restored.', 'good');
+    this.hud.log(`You sleep ${where}. Hit points and spell slots restored.`, 'good');
     const reports = this.s.party.filter((c) => !c.death.dead).map((c) => levelUp(c)).filter((x): x is NonNullable<typeof x> => !!x);
     if (reports.length) {
       for (const c of this.s.party) if (!c.death.dead) { c.hp = c.maxHp; }
@@ -1031,6 +1524,7 @@ export class Director {
   private async menu(): Promise<void> {
     const r = await this.hud.sheet<string>({
       title: 'Menu', options: [
+        { label: 'Quests', sub: questSummary(this.s), value: 'quests', icon: 'quest' },
         { label: 'Inventory', sub: invSummary(this.s.inv), value: 'inv', icon: 'potion' },
         { label: 'Journal', sub: 'Everything that has happened.', value: 'log', icon: 'sheet' },
         { label: 'Party sheets', sub: 'Abilities, skills, spells, features.', value: 'sheets', icon: 'sheet' },
@@ -1038,6 +1532,7 @@ export class Director {
       ],
     });
     if (!r) return;
+    if (r.value === 'quests') this.hud.showQuests(questLog(this.s));
     if (r.value === 'inv') this.hud.showInventory(this.s.inv);
     if (r.value === 'log') this.hud.showLog();
     if (r.value === 'sheets') this.hud.showCharacter(this.leader);
@@ -1053,10 +1548,10 @@ export class Director {
     await this.startCombat('crypt', this.s.bossSurprised ? 'enemies' : this.cryptAlerted ? 'party' : null);
   }
 
-  async startCombat(group: 'den' | 'crypt', surprised: 'party' | 'enemies' | null): Promise<void> {
-    const ids = new Set(this.w.def.spawns.filter((s) => s.group === group).map((s) => s.pos.x * 100 + s.pos.y));
-    void ids;
-    const monsters = group === 'den' ? this.denGoblins() : this.s.monsters.filter((m) => (m.faction === 'undead' || m.faction === 'object') && (m.hp > 0 || m.monsterId === 'brazier'));
+  async startCombat(group: string, surprised: 'party' | 'enemies' | null): Promise<void> {
+    const monsters = group === 'den' ? this.denGoblins()
+      : group === 'crypt' ? this.s.monsters.filter((m) => (m.faction === 'undead' || m.faction === 'object') && (m.hp > 0 || m.monsterId === 'brazier'))
+      : this.s.monsters.filter((m) => m.group === group && m.hp > 0);
     if (!monsters.length) return;
     this.save();
     this.mode = 'combat';
@@ -1072,6 +1567,12 @@ export class Director {
     sfx.thunk();
     await wait(500);
     await c.start(monsters, surprised);
+    // Brother Aldric's blessing lasts one fight.
+    if (this.s.flags.blessing) {
+      this.s.flags.blessing = false;
+      for (const h of this.s.party) if (!h.death.dead && h.hp > 0) c.addCond(h, 'blessed', { source: 'candle' });
+      this.hud.log('The Candle\'s blessing settles on the party: +1d4 to attack rolls this fight.', 'good');
+    }
     this.refresh();
     const outcome = await c.run();
     this.view.clearMarks();
@@ -1080,7 +1581,7 @@ export class Director {
     else await this.defeat(group);
   }
 
-  private async victory(group: 'den' | 'crypt', monsters: Creature[]): Promise<void> {
+  private async victory(group: string, monsters: Creature[]): Promise<void> {
     this.mode = 'explore';
     for (const c of this.s.party) {
       if (!c.death.dead && c.hp <= 0) { c.death.stable = true; }
@@ -1105,21 +1606,41 @@ export class Director {
       this.save();
       return;
     }
-    // Boss defeated: the end of the delve.
+    if (group !== 'crypt') {
+      this.s.flags[`cleared:${group}`] = true;
+      const report: Record<string, [QuestId, string]> = { wolves: ['wolves', 'Old Moss'], drowned: ['drowned', 'Brother Aldric'] };
+      const q = report[group];
+      this.hud.toast('Victory!');
+      if (q) this.hud.log(`The ${group === 'wolves' ? 'wolves are gone' : 'drowned miners rest at last'}. ${q[1]} will want to hear of it.`, 'good');
+      this.refresh();
+      this.exploreDock();
+      this.save();
+      return;
+    }
+    // Boss defeated: now carry the news home.
     this.s.bossDone = true;
     this.refresh();
+    this.exploreDock();
     this.save();
     await wait(600);
+    this.hud.showBanner('The Warden Falls', 'The violet fire dies and the Last Candle flares white. Return to Emberford and tell Elder Wenna.', 7000);
+    this.hud.log('Quest: return to Emberford and tell Elder Wenna the Emberdeep is safe.', 'good');
+  }
+
+  /** The ending, after reporting to Elder Wenna. */
+  private finale(): void {
     this.mode = 'end';
+    const living = this.s.party.filter((c) => !c.death.dead);
     const fallen = this.s.party.filter((c) => c.death.dead).map((c) => c.name);
     const denLine: Record<string, string> = {
       ally: 'You made a pact with Snikk, and kept it.', toll: 'You paid the goblins\' price and passed in peace.', fled: 'You frightened the goblins out of their own den.',
       defeated: 'You cut through Snikk\'s gang.', sneaked: 'The goblins never knew you were there.', hostile: 'The goblins fought you.', unaware: '',
     };
+    const quests = questLog(this.s).filter((q) => q.status === 'done').map((q) => q.name);
     this.hud.endScreen({
       title: 'The Candle Burns Brighter', emblem: true,
-      text: 'The Ash Warden crumbles to cinders and the violet fire dies. Somewhere above, the Last Candle flares white.',
-      lines: [denLine[this.s.den] ?? '', `Party level ${Math.max(...living.map((c) => c.level))} · ${living[0]?.xp ?? 0} XP each.`, fallen.length ? `Fallen: ${fallen.join(', ')}.` : 'Everyone made it out alive.'].filter(Boolean),
+      text: 'Emberford lights every lamp it owns. The Ash Warden is ash, the mine breathes clean air, and the Last Candle burns white again.',
+      lines: [denLine[this.s.den] ?? '', quests.length ? `Quests completed: ${quests.join(', ')}.` : '', `Party level ${Math.max(...living.map((c) => c.level))} · ${living[0]?.xp ?? 0} XP each · ${this.s.inv.gold} gold.`, fallen.length ? `Fallen: ${fallen.join(', ')}.` : 'Everyone made it home alive.'].filter(Boolean),
       buttons: [
         { label: 'Gather a new party', primary: true, onTap: () => this.hooks.onNewParty() },
         { label: 'Back to title', onTap: () => this.hooks.onQuit() },
@@ -1127,12 +1648,18 @@ export class Director {
     });
   }
 
-  private async defeat(group: 'den' | 'crypt'): Promise<void> {
+  private async defeat(group: string): Promise<void> {
     this.mode = 'end';
     sfx.death();
-    const why = group === 'den'
-      ? 'Snikk\'s gang overwhelmed you. Four blades and a bow are a lot at level 1. Sleep, a parley, or sneaking past might go better.'
-      : 'The Ash Warden kept rising while its brazier burned. Douse the brazier first, use bludgeoning weapons, and let the cleric Turn the skeletons.';
+    const whys: Record<string, string> = {
+      den: 'Snikk\'s gang overwhelmed you. Four blades and a bow are a lot at level 1. Sleep, a parley, or sneaking past might go better.',
+      crypt: 'The Ash Warden kept rising while its brazier burned. Douse the brazier first, use bludgeoning weapons, and let the cleric Turn the skeletons.',
+      wolves: 'The pack caught you off guard. Ask Captain Rusk or Old Moss where the wolves wait, and fight back to back so none of you stands alone.',
+      rats: 'The rats swarmed you in the water. Wading is slow: fight from the shaft landing and let them come to you.',
+      spider: 'The giant spider\'s venom was too much. Rest first, and keep the wizard\'s spells for it.',
+      drowned: 'The drowned miners kept getting up. Radiant light and critical hits stop them for good.',
+    };
+    const why = whys[group] ?? 'The party falls. Rest, regroup and try another way.';
     this.hud.endScreen({
       title: 'The Party Falls', text: why,
       buttons: [

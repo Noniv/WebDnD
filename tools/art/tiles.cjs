@@ -284,5 +284,8 @@ T.crypt_floor = () => {
   return o;
 };
 
+// village, forest road and lower-dungeon tiles
+Object.assign(T, require('./town.cjs')({ floorBase }));
+
 for (const [name, fn] of Object.entries(T)) write(`tiles/${name}.svg`, svg(64, 64, fn()));
 module.exports = { floorBase };

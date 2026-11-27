@@ -12,6 +12,10 @@ import { clear, esc, h, icon, layer, portrait, token } from './dom';
 import { sfx } from './sfx';
 import { getTimeScale } from '../render/tween';
 import type { Inventory } from '../game/state';
+import type { TalkVM } from '../net/protocol';
+import { TalkPanel } from './talk';
+
+export interface TalkAnswer { text: string | null; actorId: string | null }
 
 export interface DockBtn {
   id: string;
@@ -74,6 +78,12 @@ export class Hud {
   /** Co-op: hero id -> controlling player, for the party plates. */
   owners: Record<string, { name: string; me: boolean }> = {};
   private openPrompts = new Set<() => void>();
+  // AI conversation
+  protected talkPanel: TalkPanel | null = null;
+  protected talkVm: TalkVM | null = null;
+  protected talkParty: Creature[] = [];
+  /** Set while this device's player is the one who must answer. */
+  protected talkWait: ((a: TalkAnswer) => void) | null = null;
 
   constructor() {
     this.root.prepend(this.vignette);
@@ -96,7 +106,40 @@ export class Hud {
     }, true);
   }
 
+  /** Show, update (or with null, close) the conversation panel. `party`: heroes who may speak. */
+  setTalk(vm: TalkVM | null, party: Creature[] = this.talkParty): void {
+    this.talkVm = vm;
+    this.talkParty = party;
+    if (!vm) { this.talkPanel?.destroy(); this.talkPanel = null; this.talkWait = null; return; }
+    if (!this.talkPanel) {
+      this.talkPanel = new TalkPanel(this.modal, {
+        onSend: (text, actorId) => this.talkWait?.({ text, actorId }),
+        onLeave: () => this.talkWait?.({ text: null, actorId: null }),
+        onContinue: () => this.talkWait?.({ text: null, actorId: null }),
+        onTakeOver: () => this.talkTakeOver(),
+      });
+    }
+    this.renderTalk();
+  }
+
+  protected renderTalk(): void {
+    if (this.talkPanel && this.talkVm) this.talkPanel.update(this.talkVm, this.talkWait !== null, this.talkParty, this.talkNames(), this.isHost());
+  }
+
+  protected talkNames(): Record<string, string> { return {}; }
+  protected isHost(): boolean { return false; }
+  protected talkTakeOver(): void { /* co-op host only */ }
+
+  /** Wait for the player whose turn it is to speak (text) or to leave / continue (null). */
+  talkAsk(vm: TalkVM, party: Creature[]): Promise<TalkAnswer> {
+    return new Promise((resolve) => {
+      this.talkWait = (a) => { this.talkWait = null; resolve(a); };
+      this.setTalk(vm, party);
+    });
+  }
+
   destroy(): void {
+    this.talkPanel?.destroy();
     this.root.remove();
     this.modal.remove();
   }
@@ -176,6 +219,16 @@ export class Hud {
     void this.openPanel('Journal', body);
   }
 
+  /** The quest journal. */
+  showQuests(list: { name: string; goal: string; reward: string; giver: string; status: 'active' | 'ready' | 'done' }[]): void {
+    const word = { active: 'In progress', ready: 'Done: go and tell them', done: 'Complete' } as const;
+    const rows = list.map((q) => h('div', { class: `inv-row quest ${q.status}` }, icon(q.status === 'done' ? 'xp' : 'quest', 'inv-ic'),
+      h('div', {}, h('p', { class: 'feat' }, h('b', {}, q.name), ` ${q.goal}`),
+        h('p', { class: 'hint', style: 'margin:-4px 0 10px' }, `${word[q.status]} · from ${q.giver} · reward: ${q.reward}`))));
+    if (!rows.length) rows.push(h('p', { class: 'feat' }, 'No quests yet. Talk to the people of Emberford: they need help.'));
+    void this.openPanel('Quests', h('div', { class: 'inv' }, ...rows));
+  }
+
   /** The party's shared packs, with a plain-language line on what each thing is for. */
   showInventory(inv: Inventory): void {
     const row = (ic: string, name: string, text: string) =>
@@ -184,7 +237,8 @@ export class Hud {
     if (inv.potions > 0) rows.push(row('potion', `Potion of Healing ×${inv.potions}.`, 'Restores 2d4 + 2 hit points, even to a hero who is down. Use the Potion button.'));
     if (inv.keys.length) rows.push(row('key', 'Crypt key.', 'Opens the locked door to the crypt.'));
     if (inv.phial > 0) rows.push(row('turn_undead', 'Ember Phial.', 'Holy fire in a bottle. Throw it to douse the Ash Warden\'s brazier, so it stops healing him.'));
-    if (inv.gold > 0) rows.push(row('gold', `${inv.gold} gold pieces.`, 'Loot. It counts toward your final tally.'));
+    for (const it of inv.items ?? []) if (it === 'ore') rows.push(row('gold', 'Ember-ore.', 'A glowing lump from the Lost Lode. Old Torvin the smith wants it.'));
+    if (inv.gold > 0) rows.push(row('gold', `${inv.gold} gold pieces.`, 'Spend it in Emberford: potions at Torvin\'s forge, a bed at the inn.'));
     if (!rows.length) rows.push(h('p', { class: 'feat' }, 'Your packs are empty. Search rooms and open chests to find things.'));
     void this.openPanel('Inventory', h('div', { class: 'inv' }, ...rows));
   }

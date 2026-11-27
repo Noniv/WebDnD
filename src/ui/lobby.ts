@@ -78,6 +78,8 @@ export interface LobbyOptions {
   onEditParty?: () => void;
   onStart?: () => void;
   onLeave: () => void;
+  /** Host only: the AI dungeon master card (kept as one element so typing survives refreshes). */
+  dmCard?: HTMLElement;
 }
 
 export class LobbyView {
@@ -167,6 +169,7 @@ export class LobbyView {
       h('p', { class: 'hint', style: 'margin:0 0 8px' }, 'Each player takes a hero. Heroes nobody takes are played by the host. You can play more than one.'),
       heroes));
 
+    if (o.dmCard) this.body.append(o.dmCard);
     if (data.error) this.body.append(h('p', { class: 'lobby-err' }, data.error));
     this.body.append(h('div', { class: 'lobby-foot' }, o.isHost
       ? h('button', { class: 'btn primary', style: 'width:100%', onclick: () => { sfx.success(); o.onStart?.(); } }, `Start the delve · ${data.players.length} player${data.players.length > 1 ? 's' : ''}`)

@@ -343,6 +343,8 @@ input { font: inherit; user-select: text; -webkit-user-select: text; touch-actio
 .sheet .close img { width: 22px; opacity: 0.9; }
 .inv-row { display: flex; gap: 12px; align-items: flex-start; }
 .inv-row .inv-ic { width: 30px; height: 30px; flex: none; margin-top: 1px; }
+.inv-row.quest.ready .hint { color: #9ee0c8; font-weight: 700; }
+.inv-row.quest.done { opacity: 0.6; }
 .kv { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; font-size: 14px; color: var(--ivory); }
 .kv b { font-family: var(--display); color: var(--gold); }
 .feat { font-size: 14px; line-height: 1.4; margin: 0 0 7px; color: var(--ivory); }
@@ -364,6 +366,34 @@ input { font: inherit; user-select: text; -webkit-user-select: text; touch-actio
 .dlg .say { font-size: 17px; line-height: 1.45; margin: 0 0 14px; color: var(--ivory); }
 .dlg .say.nar { font-style: italic; color: var(--muted); }
 .dlg .opt b { font-family: var(--body) !important; color: var(--ivory) !important; font-size: 15.5px; }
+/* AI conversation panel */
+.dlg .head .spk small { display: block; font-family: var(--body); font-size: 13px; font-weight: 600; letter-spacing: 0; color: var(--muted); -webkit-text-fill-color: var(--muted); }
+.talk-page { display: flex; flex-direction: column; min-height: 0; }
+.talk-log { overflow-y: auto; max-height: 38vh; min-height: 64px; padding-right: 2px; touch-action: pan-y; }
+.talk-log .say { font-size: 16.5px; margin: 0 0 10px; }
+.talk-log .said { font-size: 15px; line-height: 1.4; margin: 0 0 10px; color: var(--gold-hi); font-style: italic; }
+.talk-log .said b { font-style: normal; color: var(--gold); }
+.talk-log .rollnote { font-size: 13.5px; font-weight: 800; margin: 0 0 10px; padding: 5px 10px; border-radius: 8px; background: rgba(214, 178, 94, 0.12); border: 1px solid rgba(214, 178, 94, 0.35); color: var(--gold-hi); }
+.talk-log .rollnote.bad { background: rgba(208, 70, 61, 0.14); border-color: rgba(208, 70, 61, 0.45); color: #ffc9c2; }
+.talk-log .note { font-size: 13.5px; margin: 0 0 10px; color: #c9f1e5; font-weight: 700; }
+.talk-status:empty { display: none; }
+.talk-status.thinking::after { content: ''; display: inline-block; width: 1.2em; animation: dots 1.2s steps(4) infinite; overflow: hidden; vertical-align: bottom; }
+@keyframes dots { from { width: 0; } to { width: 1.2em; } }
+.talk-controls { margin-top: 4px; }
+.talk-sugs { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px; }
+.talk-sugs .chip { text-align: left; white-space: normal; line-height: 1.25; max-width: 100%; }
+.talk-row { display: flex; gap: 8px; align-items: stretch; }
+.talk-input { flex: 1; min-width: 0; resize: none; font: inherit; font-size: 16px; line-height: 1.35; color: var(--ivory); background: rgba(5, 8, 22, 0.75); border: 1px solid rgba(214, 178, 94, 0.45); border-radius: 10px; padding: 9px 11px; }
+.talk-input:focus { outline: none; border-color: var(--gold-hi); box-shadow: 0 0 0 2px rgba(246, 223, 162, 0.2); }
+.talk-send { min-width: 76px; }
+.talk-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.talk-foot .hint { margin: 0; font-size: 12px; }
+.talk-foot .btn { flex: none; }
+.dm-card input { width: 100%; font: inherit; font-size: 16px; color: var(--ivory); background: rgba(5, 8, 22, 0.75); border: 1px solid rgba(214, 178, 94, 0.45); border-radius: 10px; padding: 9px 11px; margin: 4px 0 8px; }
+.dm-card .row { display: flex; gap: 8px; }
+.dm-card .status { font-size: 13px; margin: 6px 0 0; color: var(--muted); }
+.dm-card .status.ok { color: #9ee0c8; }
+.dm-card .status.bad { color: #ffb3a9; }
 .waitnote { font-weight: 800; color: var(--gold); margin: 0 0 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
 
 .big { text-align: center; }

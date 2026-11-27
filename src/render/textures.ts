@@ -5,8 +5,16 @@ export const TILE_KEYS = [
   'floor_1', 'floor_2', 'floor_3', 'wall', 'door_closed', 'door_open', 'door_locked', 'door_secret', 'rubble',
   'trap_plate', 'trap_disarmed', 'chest_closed', 'chest_open', 'campfire', 'shrine', 'brazier', 'brazier_out',
   'stairs_up', 'loose_stone', 'bones', 'crypt_floor',
+  // village, road and the lower workings
+  'grass_1', 'grass_2', 'grass_3', 'road_1', 'road_2', 'dirt', 'water', 'cave_floor', 'flooded_floor', 'house_wall', 'roof',
+  'tree', 'pine', 'bush', 'fence', 'well', 'stall', 'anvil', 'barrels', 'signpost', 'mine_entrance', 'stairs_down',
+  'cage', 'cage_open', 'door_house', 'altar',
 ];
-export const TOKEN_KEYS = ['fighter', 'rogue', 'wizard', 'cleric', 'goblin', 'goblin_boss', 'skeleton', 'ash_warden'];
+export const TOKEN_KEYS = [
+  'fighter', 'rogue', 'wizard', 'cleric', 'goblin', 'goblin_boss', 'skeleton', 'ash_warden',
+  'wolf', 'giant_rat', 'zombie', 'giant_spider',
+  'innkeeper', 'priest', 'smith', 'elder', 'child', 'guard', 'stranger', 'miner', 'hermit',
+];
 export const ICON_KEYS = ['d20', 'prone', 'poisoned', 'frightened', 'unconscious', 'blessed', 'hidden', 'concentration', 'dodging', 'sapped', 'shield_spell', 'steady_aim', 'turn_undead'];
 
 const cache = new Map<string, Texture>();
@@ -51,7 +59,19 @@ function fallback(key: string, r: Renderer): Texture {
   const g = new Graphics();
   const [kind, name] = key.split('/');
   if (kind === 'tiles') {
-    const col = name === 'wall' ? PAL.stoneDark : name.includes('crypt') ? 0x2c2433 : PAL.stone;
+    const ground: Record<string, number> = {
+      grass_1: 0x3f5a2c, grass_2: 0x45612f, grass_3: 0x3b5529, road_1: 0x6b6259, road_2: 0x645b52, dirt: 0x6b5236,
+      water: 0x1f4a5a, cave_floor: 0x2f2b2a, flooded_floor: 0x24474c, house_wall: 0x8a6a48, roof: 0x6e4b2a,
+    };
+    const props = ['tree', 'pine', 'bush', 'fence', 'well', 'stall', 'anvil', 'barrels', 'signpost', 'mine_entrance', 'stairs_down', 'cage', 'cage_open', 'altar'];
+    if (props.includes(name)) {
+      const pc: Record<string, number> = { tree: 0x2f6b2a, pine: 0x1f4a2a, bush: 0x3f7a35, mine_entrance: 0x14110f, stairs_down: 0x2a2520 };
+      g.circle(32, 32, name === 'bush' ? 16 : 26).fill(pc[name] ?? 0x7a4a2a).stroke({ width: 2, color: PAL.ink });
+      const t = r.generateTexture({ target: g, resolution: 2 });
+      g.destroy();
+      return t;
+    }
+    const col = ground[name] ?? (name === 'wall' ? PAL.stoneDark : name.includes('crypt') ? 0x2c2433 : PAL.stone);
     g.rect(0, 0, 64, 64).fill(col).stroke({ width: 2, color: PAL.ink, alignment: 1 });
     if (name.includes('door')) g.rect(8, 22, 48, 20).fill(name.includes('open') ? PAL.stone : 0x6b4a2b);
     if (name.includes('locked')) g.circle(32, 32, 7).fill(PAL.gold);
@@ -63,7 +83,7 @@ function fallback(key: string, r: Renderer): Texture {
   } else if (kind === 'tokens') {
     const col: Record<string, number> = { fighter: 0x4a7bb0, rogue: PAL.verdigris, wizard: PAL.arcane, cleric: PAL.gold };
     g.circle(64, 64, 58).fill(PAL.stoneDark).stroke({ width: 8, color: col[name] ?? PAL.blood });
-    g.circle(64, 54, 22).fill(name === 'skeleton' ? PAL.parchment : name.startsWith('goblin') ? PAL.poison : PAL.parchmentDark);
+    g.circle(64, 54, 22).fill(name === 'skeleton' || name === 'zombie' ? PAL.parchment : name.startsWith('goblin') ? PAL.poison : PAL.parchmentDark);
     g.roundRect(34, 74, 60, 30, 14).fill(col[name] ?? 0x5a2a22);
   } else {
     g.circle(32, 32, 26).fill(PAL.parchment).stroke({ width: 4, color: PAL.ink });
