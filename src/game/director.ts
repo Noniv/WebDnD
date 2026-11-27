@@ -274,8 +274,12 @@ export class Director {
     if (this.mode === 'explore') this.s.leader = this.leadIdx(pid);
   }
 
-  /** Something holds the table (an interaction or a scene): new actions must wait. */
-  private get blocked(): boolean { return this.busy || this.scene > 0; }
+  /**
+   * Something holds the table (an interaction or a scene): new actions must wait.
+   * A fight started by a scene (walking into the wolves or the crypt) runs inside that scene,
+   * so in combat only `busy` counts: the turn order already decides who may act.
+   */
+  private get blocked(): boolean { return this.busy || (this.scene > 0 && this.mode !== 'combat'); }
 
   /** A message for one player only. */
   private tellPlayer(pid: string, msg: string): void {
@@ -1497,8 +1501,12 @@ export class Director {
   private async guard(fn: () => Promise<void>): Promise<void> {
     const who = this.hud.decider ?? this.me;
     if (this.blocked) { this.tellBusy(who); return; }
-    await this.stopWalk(who);
-    if (this.blocked) { this.tellBusy(who); return; }
+    // Only exploring walks can be stopped: a fight that began mid-walk runs inside that walk,
+    // so waiting for it here would wait for the whole fight.
+    if (this.mode === 'explore') {
+      await this.stopWalk(who);
+      if (this.blocked) { this.tellBusy(who); return; }
+    }
     this.useLead(who);
     this.busy = true;
     try { await fn(); } finally { this.busy = false; if (this.mode === 'explore') this.exploreDock(); }
